@@ -1,0 +1,123 @@
+# Construit l'image du pod et la publie sur GHCR (le registre de conteneurs GitHub).
+#
+# Pourquoi passer par ici plutôt que par `docker build` en local : l'image pèse
+# une dizaine de Go. La construire sur un runner GitHub évite de la téléverser
+# depuis une connexion domestique — le runner et GHCR sont sur le même réseau,
+# le push prend une minute au lieu de plusieurs heures.
+
+name: Image du pod
+
+on:
+  # Reconstruit dès que le code embarqué dans l'image change.
+  push:
+    branches: [main]
+    paths:
+      - "docker/**"
+      - "server/**"
+      - "common/**"
+      - "client/**"
+      - "bench/**"
+      - ".github/workflows/build-image.yml"
+  # Et permet un lancement manuel depuis l'onglet Actions.
+  workflow_dispatch:
+    inputs:
+      vggt_omega_ref:
+        description: "Branche ou commit du dépôt vggt-omega à embarquer"
+        default: "main"
+        required: false
+
+# Le jeton automatique de GitHub suffit à publier sur GHCR : aucun secret à créer.
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180 # la compilation des noyaux CUDA de gsplat est longue
+
+    steps:
+      # Le runner n'a qu'une trentaine de Go libres, l'image en réclame plus.
+      # On supprime les SDK préinstallés dont on n'a aucun usage (~25 Go).
+      - name: Libérer de l'espace disque
+        run: |
+          echo "Avant :" && df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/share/boost /opt/hostedtoolcache /usr/local/.ghcup
+          sudo docker image prune -af || true
+          echo "Après :" && df -h / | tail -1
+
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+
+      # GHCR impose des noms en minuscules ; un pseudo GitHub peut contenir des
+      # majuscules, d'où la conversion.
+      - name: Calculer le nom de l'image
+        id: image
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # Buildx gère le cache de couches distant, que `docker build` ne sait pas faire.
+      - name: Préparer Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Se connecter à GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Produit `latest` plus un tag horodaté par commit, pour pouvoir revenir
+      # en arrière si une image casse.
+      - name: Calculer les tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=ref,event=tag
+
+      - name: Construire et publier
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          # RunPod ne fournit que du x86_64 : compiler pour ARM doublerait
+          # inutilement la durée du build.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VGGT_OMEGA_REF=${{ inputs.vggt_omega_ref || 'main' }}
+          # Cache stocké dans le registre lui-même : pas de plafond de 10 Go
+          # comme le cache natif d'Actions, et les couches lourdes (CUDA, pip)
+          # sont réutilisées d'un build à l'autre.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache,mode=max
+          # Sans cela, l'image publiée est un index multi-manifestes que
+          # certains hébergeurs ne savent pas résoudre.
+          provenance: false
+
+      - name: Récapitulatif
+        run: |
+          {
+            echo "## Image publiée"
+            echo ""
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}" | sed 's/^/  /'
+            echo '```'
+            echo ""
+            echo "À coller dans le champ **Container Image** du template RunPod :"
+            echo ""
+            echo "    ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest"
+            echo ""
+            echo "> Au tout premier build, rendre le paquet public :"
+            echo "> page du dépôt → Packages → le paquet → Package settings → Change visibility → Public."
+            echo "> Sinon RunPod ne pourra pas le télécharger sans identifiants de registre."
+          } >> "$GITHUB_STEP_SUMMARY"

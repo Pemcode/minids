@@ -1,0 +1,18 @@
+# Tests locaux, sans GPU. Le client seul n'a besoin de rien d'autre que
+# Python et ffmpeg — ces dépendances ne servent qu'au serveur factice et aux tests.
+pytest>=8.0
+fastapi>=0.115
+uvicorn>=0.30
+httpx>=0.27
+pydantic>=2.7
+numpy>=1.26
+
+# Requis uniquement pour tests/test_meshing.py et tests/test_texture_and_remesh.py
+# (TSDF, Poisson, nettoyage, bake, re-maillage local). Ces tests sont ignorés
+# automatiquement si les paquets sont absents.
+#
+# ⚠ Open3D 0.19 n'a pas de wheel pour Python 3.13 : créer le venv en 3.12.
+#     py -3.12 -m venv .venv312
+#     .\.venv312\Scripts\python.exe -m pip install -r requirements-dev.txt open3d xatlas
+open3d>=0.18; python_version < "3.13"
+xatlas>=0.0.9; python_version < "3.13"

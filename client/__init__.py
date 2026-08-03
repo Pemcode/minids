@@ -1,0 +1,1 @@
+"""Client miniDS (machine locale)."""

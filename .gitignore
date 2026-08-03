@@ -1,0 +1,11 @@
+.venv/
+.venv312/
+out/
+data/
+bench_out/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.part
+.ruff_cache/
+minids.env.ps1

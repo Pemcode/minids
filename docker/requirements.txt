@@ -1,0 +1,26 @@
+# Dépendances du pod. torch/torchvision viennent de l'image de base CUDA.
+
+# API
+fastapi==0.118.0
+uvicorn[standard]==0.37.0
+pydantic==2.11.9
+
+# Géométrie et maillage
+numpy==2.1.3
+open3d==0.19.0
+xatlas==0.0.10
+opencv-python-headless==4.11.0.86
+pillow==11.3.0
+
+# Splatting 2DGS
+gsplat==1.5.3
+
+# VGGT-Ω et SAM 3
+transformers==4.57.0
+huggingface_hub==0.35.3
+accelerate==1.10.1
+safetensors==0.6.2
+einops==0.8.1
+
+# pycolmap (ajustement de faisceaux) est installé à part dans le Dockerfile :
+# il est optionnel, et son absence de wheel ne doit pas faire échouer l'image.
