@@ -147,16 +147,32 @@ class MinidsClient:
         response = self._request("GET", f"/jobs/{job_id}/chunks")
         return {int(index) for index in response.get("received", [])}
 
-    def upload(self, job_id: str, path: Path, chunk_size: int = DEFAULT_CHUNK, quiet: bool = False) -> None:
+    def upload(
+        self,
+        job_id: str,
+        path: Path,
+        chunk_size: int = DEFAULT_CHUNK,
+        quiet: bool = False,
+        on_progress: Callable[[int, int], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> None:
+        """Téléverse par morceaux, en sautant ceux déjà reçus.
+
+        `on_progress(envoyé, total)` alimente une barre externe (interface
+        graphique) ; `should_stop()` est consulté entre deux morceaux, ce qui
+        borne le délai d'annulation à un seul chunk.
+        """
         path = Path(path)
         size = path.stat().st_size
         total_chunks = (size + chunk_size - 1) // chunk_size
         already = self.uploaded_chunks(job_id)
         progress = Progress(f"upload  {path.name}", size, quiet)
-        sent = len(already) * chunk_size
+        sent = min(size, len(already) * chunk_size)
 
         with path.open("rb") as handle:
             for index in range(total_chunks):
+                if should_stop is not None and should_stop():
+                    raise MinidsError("upload interrompu")
                 if index in already:
                     continue
                 handle.seek(index * chunk_size)
@@ -167,7 +183,11 @@ class MinidsClient:
                 )
                 sent = min(size, sent + len(block))
                 progress.update(sent)
+                if on_progress is not None:
+                    on_progress(sent, size)
         progress.update(size)
+        if on_progress is not None:
+            on_progress(size, size)
 
     def start(self, job_id: str) -> dict[str, Any]:
         return self._request("POST", f"/jobs/{job_id}/start", b"")
@@ -177,6 +197,16 @@ class MinidsClient:
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         return self._request("POST", f"/jobs/{job_id}/cancel", b"")
+
+    def jobs(self) -> list[dict[str, Any]]:
+        """Jobs connus du pod, du plus récent au plus ancien.
+
+        Sert à rejoindre un scan lancé depuis une autre session : le pod garde
+        l'état sur disque, donc un client qui a été fermé peut retrouver le job
+        sans en connaître l'identifiant par cœur.
+        """
+        jobs = self._request("GET", "/jobs").get("jobs", [])
+        return sorted(jobs, key=lambda job: job.get("created_at") or 0, reverse=True)
 
     def artifacts(self, job_id: str) -> list[dict[str, Any]]:
         return self._request("GET", f"/jobs/{job_id}/artifacts").get("artifacts", [])
@@ -208,6 +238,8 @@ class MinidsClient:
         chunk_size: int = DEFAULT_CHUNK,
         quiet: bool = False,
         expected_sha256: str | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> Path:
         """Télécharge un artefact par `Range`, en reprenant un `.part` existant."""
         destination = Path(destination)
@@ -219,6 +251,8 @@ class MinidsClient:
         progress: Progress | None = None
 
         while total is None or offset < total:
+            if should_stop is not None and should_stop():
+                raise MinidsError("téléchargement interrompu")
             end = offset + chunk_size - 1
             try:
                 payload, headers, status = self._request(
@@ -248,6 +282,8 @@ class MinidsClient:
             offset += len(payload)
             if progress:
                 progress.update(min(offset, total))
+            if on_progress is not None:
+                on_progress(min(offset, total), total)
 
         if total is not None and offset != total:
             raise MinidsError(f"{name} : {offset} octets reçus sur {total}")

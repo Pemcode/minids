@@ -12,9 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import sys
-import tarfile
 import tempfile
 import time
 from pathlib import Path
@@ -23,6 +21,7 @@ from typing import Any
 if __package__ in (None, ""):  # exécution directe : `python client/minids.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from client.payload import build_payload  # noqa: E402
 from client.transport import DEFAULT_CHUNK, MinidsClient, MinidsError, sha256_file  # noqa: E402
 from common.video import extract_frames  # noqa: E402
 
@@ -149,37 +148,17 @@ def make_client(args: argparse.Namespace) -> MinidsClient:
 
 def prepare_payload(args: argparse.Namespace, workdir: Path) -> Path:
     """Retourne le fichier à envoyer : archive d'images, ou vidéo brute."""
-    source = Path(args.video)
-    if not source.exists():
-        raise MinidsError(f"introuvable: {source}")
-
-    if source.is_file() and args.send_video:
-        print(f"envoi de la vidéo brute ({source.stat().st_size / 1e6:.0f} Mo) — extraction côté pod")
-        return source
-
-    frames_dir = workdir / "frames"
-    if source.is_dir():
-        images = sorted(p for p in source.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png"})
-        if not images:
-            raise MinidsError(f"aucune image dans {source}")
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        for index, image in enumerate(images):
-            shutil.copy2(image, frames_dir / f"frame_{index:05d}{image.suffix.lower()}")
-        print(f"{len(images)} images reprises depuis {source}")
-    else:
-        frames = extract_frames(
-            source, frames_dir, count=args.frames, long_side=args.long_side,
+    try:
+        return build_payload(
+            source=Path(args.video),
+            workdir=workdir,
+            frames=args.frames,
+            long_side=args.long_side,
+            send_video=args.send_video,
             log=lambda message: print(f"  {message}"),
         )
-        if not frames:
-            raise MinidsError("extraction ffmpeg vide")
-
-    archive = workdir / "frames.tar"
-    with tarfile.open(archive, "w") as tar:
-        for image in sorted(frames_dir.iterdir()):
-            tar.add(image, arcname=image.name)
-    print(f"archive {archive.stat().st_size / 1e6:.1f} Mo prête")
-    return archive
+    except (FileNotFoundError, ValueError) as exc:
+        raise MinidsError(str(exc)) from exc
 
 
 def submit_job(client: MinidsClient, args: argparse.Namespace, payload: Path) -> str:

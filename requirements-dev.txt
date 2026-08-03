@@ -7,6 +7,11 @@ httpx>=0.27
 pydantic>=2.7
 numpy>=1.26
 
+# Interface graphique (`python -m gui`) et tests/test_gui.py. La CLI, elle, reste
+# en bibliothèque standard pure : ces deux paquets ne lui sont jamais nécessaires.
+PyQt6>=6.6
+tqdm>=4.66
+
 # Requis uniquement pour tests/test_meshing.py et tests/test_texture_and_remesh.py
 # (TSDF, Poisson, nettoyage, bake, re-maillage local). Ces tests sont ignorés
 # automatiquement si les paquets sont absents.

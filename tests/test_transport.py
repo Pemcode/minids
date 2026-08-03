@@ -163,3 +163,17 @@ def test_cancel_from_client(client, frames_archive):
 
     client.cancel(job_id)
     assert client.wait(job_id, poll_seconds=0.3)["status"] == "cancelled"
+
+
+def test_jobs_lists_the_pod_state_most_recent_first(client, frames_archive):
+    """Retrouver un job sans en connaître l'identifiant : c'est ce qui permet de
+    rejoindre un scan lancé depuis une autre session."""
+    older = client.create_job("a.tar", frames_archive.stat().st_size, CHUNK_SIZE, None, {})
+    newer = client.create_job("b.tar", frames_archive.stat().st_size, CHUNK_SIZE, None, {})
+
+    jobs = client.jobs()
+    identifiers = [job["job_id"] for job in jobs]
+
+    assert identifiers.index(newer) < identifiers.index(older)
+    assert {older, newer} <= set(identifiers)
+    assert jobs[0]["status"] == "created"  # pas encore démarré

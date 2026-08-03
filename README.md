@@ -149,6 +149,36 @@ relouer un GPU.
 
 ---
 
+## Interface graphique
+
+```powershell
+pip install PyQt6 tqdm
+python -m gui
+```
+
+Même client, même transport, même archive d'images : un scan lancé depuis
+l'interface est comparable à un scan lancé en ligne de commande — c'est pourquoi
+la préparation de la charge utile vit dans `client/payload.py`, partagée par les
+deux.
+
+| Onglet | Ce qu'on y fait |
+|---|---|
+| Connexion | URL et jeton du pod, test de `/health` : GPU, VRAM libre, CUDA, et repérage du mode factice. Le jeton n'est écrit sur disque que si la case est cochée |
+| Scan | Tous les paramètres de `run`, avec trois préréglages (validation ~2 min, qualité ~15 min, comparatif de backends), puis suivi en direct : barre du pipeline, barre de transfert, ETA, débit, frise du temps par étape et journal du pod |
+| Résultats | Aperçu rendu, triangles, étanchéité, couverture de texture, gaussiennes, débits montant et descendant, liste des artefacts, ouverture du GLB dans Open3D |
+| Historique | Tous les scans passés avec leurs paramètres et leurs mesures, médianes de durée et de triangles, temps moyen par étape |
+
+**Reprendre un scan en cours.** Le pod persiste l'état de ses jobs : fermer la
+fenêtre — ou la perdre — n'interrompt pas le scan. L'identifiant du job est
+mémorisé et repropose à la réouverture ; « Jobs du pod… » liste ceux que le pod
+connaît, y compris ceux lancés depuis la CLI. « Rejoindre » reprend le suivi
+puis télécharge les artefacts. Sur un scan de 15 minutes de GPU facturé, c'est
+la différence entre un incident et une contrariété.
+
+Les réglages et l'historique sont rangés dans `~/.minids/`, hors du dépôt.
+
+---
+
 ## Conseils de prise de vue
 
 Ce sont eux qui font la différence, bien plus que les hyperparamètres :
@@ -169,11 +199,12 @@ Ce sont eux qui font la différence, bien plus que les hyperparamètres :
 # Open3D n'a pas de wheel Python 3.13 : le venv de test est en 3.12.
 py -3.12 -m venv .venv312
 .\.venv312\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv312\Scripts\python.exe -m pytest tests/        # 51 tests
+.\.venv312\Scripts\python.exe -m pytest tests/        # 70 tests
 ```
 
 En Python 3.13, les deux fichiers de test qui dépendent d'Open3D sont ignorés
-automatiquement (40 tests restants).
+automatiquement (59 tests restants). Les 18 tests d'interface le sont aussi si
+PyQt6 est absent — ils tournent sans écran, via `QT_QPA_PLATFORM=offscreen`.
 
 Le mode `MINIDS_FAKE_GPU=1` rejoue les 10 étapes, la progression et les
 artefacts sans GPU ni modèle — il sert à valider tout le transport avant de
@@ -189,7 +220,7 @@ python client/minids.py run video.mp4
 
 ### Ce qui est vérifié, et ce qui ne peut pas l'être ici
 
-**51 tests passent sur cette machine.** Les plus utiles reposent sur une vérité
+**70 tests passent sur cette machine.** Les plus utiles reposent sur une vérité
 terrain synthétique : un objet connu (sphère + boîte), des caméras en orbite, des
 profondeurs rendues exactement — ce qui permet de mesurer l'erreur du *code*,
 sans modèle. Sont couverts ainsi la fusion TSDF (Chamfer < 1 % de la diagonale),
@@ -203,6 +234,12 @@ d'axes, PNG relu octet à octet, validation par un parseur glTF tiers), sélecti
 d'images par netteté sur une vraie vidéo ffmpeg, et le transport complet contre
 un vrai serveur uvicorn — reprise d'upload, reprise de téléchargement, `.part`
 périmé, sha256 corrompu, annulation.
+
+L'interface est testée de la même façon : la vraie fenêtre est construite en
+`offscreen`, remplie, et lance un scan complet contre un serveur uvicorn en mode
+factice. C'est la chaîne signaux/threads qui est vérifiée — l'endroit où une
+interface Qt casse réellement — ainsi que la reprise d'un job soumis en dehors de
+la fenêtre.
 
 > Ces tests ont déjà payé : ils ont révélé que `create_rays_pinhole` d'Open3D
 > renvoie des directions **non normalisées** (composante z = 1), donc que `t_hit`
