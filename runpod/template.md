@@ -68,6 +68,7 @@ Réponse attendue : `cuda_available: true`, le nom du GPU et la VRAM libre.
 
 | Symptôme | Cause | Correction |
 |---|---|---|
+| **403 Forbidden**, alors que `/health` répond dans un navigateur | Cloudflare bloque l'agent `Python-urllib` par défaut | corrigé côté client (en-tête `User-Agent` explicite) — mettre le dépôt à jour. miniDS lui-même ne renvoie jamais 403 : tout 403 vient du proxy |
 | **502 Bad Gateway** | serveur pas encore prêt | attendre ~60 s (chargement des poids), puis réessayer |
 | 502 persistant | port non exposé | ajouter `8000` dans **Expose HTTP Ports** du template |
 | **503 MINIDS_TOKEN non configuré** | variable absente | définir `MINIDS_TOKEN`, ou lire celui des logs |

@@ -165,6 +165,28 @@ def test_cancel_from_client(client, frames_archive):
     assert client.wait(job_id, poll_seconds=0.3)["status"] == "cancelled"
 
 
+def test_requests_announce_an_explicit_user_agent(client, monkeypatch):
+    """Cloudflare, devant le proxy RunPod, renvoie 403 à l'agent par défaut d'urllib.
+
+    Le pod n'est alors jamais atteint : `/health` répond dans un navigateur mais
+    le client se voit tout refuser, avec une configuration pourtant correcte.
+    """
+    import urllib.request
+
+    seen: list[str | None] = []
+    real_urlopen = urllib.request.urlopen
+
+    def spy(request, *args, **kwargs):
+        seen.append(request.get_header("User-agent"))
+        return real_urlopen(request, *args, **kwargs)
+
+    monkeypatch.setattr(urllib.request, "urlopen", spy)
+    client.health()
+
+    assert seen, "aucune requête émise"
+    assert seen[0] and "Python-urllib" not in seen[0]
+
+
 def test_jobs_lists_the_pod_state_most_recent_first(client, frames_archive):
     """Retrouver un job sans en connaître l'identifiant : c'est ce qui permet de
     rejoindre un scan lancé depuis une autre session."""

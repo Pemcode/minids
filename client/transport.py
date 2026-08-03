@@ -26,6 +26,12 @@ DEFAULT_CHUNK = 8 * 1024 * 1024
 DEFAULT_TIMEOUT = 90  # sous les 100 s du proxy
 RETRY_STATUSES = {408, 429, 500, 502, 503, 504, 520, 522, 524}
 
+# Sans en-tête explicite, urllib s'annonce « Python-urllib/3.x » — que Cloudflare,
+# devant le proxy RunPod, bloque en 403 avant même d'atteindre le pod. Le
+# symptôme est déroutant : /health répond dans un navigateur, et le client se
+# voit refuser tout accès avec une configuration pourtant correcte.
+USER_AGENT = "minids-client/0.1.0"
+
 
 class MinidsError(RuntimeError):
     pass
@@ -101,7 +107,11 @@ class MinidsClient:
         timeout: int | None = None,
     ) -> Any:
         url = f"{self.url}{path}"
-        all_headers = {"Authorization": f"Bearer {self.token}", **(headers or {})}
+        all_headers = {
+            "Authorization": f"Bearer {self.token}",
+            "User-Agent": USER_AGENT,
+            **(headers or {}),
+        }
         last_error: Exception | None = None
 
         for attempt in range(self.retries):
