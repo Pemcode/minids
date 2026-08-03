@@ -76,6 +76,7 @@ class MainWindow(QMainWindow):
         self._scan_started_at = 0.0
         self._loading_preset = False
         self._source_label = ""
+        self._model_access_warning = ""
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_connection_tab(), "Connexion")
@@ -709,12 +710,19 @@ class MainWindow(QMainWindow):
         )
         self.card_version.set_value(str(info.get("version", "—")))
 
+        # Un scan atteint l'étape `vggt` après cinq étapes déjà facturées. Si les
+        # identifiants du modèle manquent, il vaut mieux le savoir maintenant.
+        self._model_access_warning = "" if info.get("fake_gpu") else self._missing_model_access(info)
+
         if info.get("fake_gpu"):
             self.status_dot.set_state("connecté — mode factice", theme.WARNING)
             self.health_detail.setText(
                 "Le pod tourne avec MINIDS_FAKE_GPU=1 : les artefacts sont synthétiques. "
                 "Idéal pour valider le transport, inutile pour une vraie reconstruction."
             )
+        elif self._model_access_warning:
+            self.status_dot.set_state("connecté — modèle inaccessible", theme.WARNING)
+            self.health_detail.setText(self._model_access_warning)
         elif cuda:
             self.status_dot.set_state("connecté", theme.SUCCESS)
             self.health_detail.setText(f"{info.get('jobs', 0)} job(s) connus du pod.")
@@ -722,6 +730,32 @@ class MainWindow(QMainWindow):
             self.status_dot.set_state("connecté — sans CUDA", theme.WARNING)
             self.health_detail.setText("Le pod répond mais ne voit aucun GPU : l'inférence serait inutilisable.")
         self._save_settings()
+
+    @staticmethod
+    def _missing_model_access(info: dict) -> str:
+        """Ce qui manque au pod pour que l'étape `vggt` puisse aboutir.
+
+        Les anciens pods ne publient pas ces champs : dans le doute, on ne dit
+        rien plutôt que d'inventer une alerte.
+        """
+        missing = []
+        if "hf_token_configured" in info and not info["hf_token_configured"]:
+            missing.append(
+                "<b>HF_TOKEN</b> n'est pas défini sur le pod — les poids VGGT-Ω sont sous accès "
+                "restreint, et le job échouera à l'étape <code>vggt</code> avec « Please log in »."
+            )
+        if "checkpoint" in info and not info["checkpoint"]:
+            missing.append(
+                "<b>MINIDS_CKPT</b> est vide — attendu : "
+                "<code>facebook/VGGT-Omega:vggt_omega_1b_512.pt</code>."
+            )
+        if not missing:
+            return ""
+        return (
+            "<br>".join(missing)
+            + "<br><br>Corrige les variables du template RunPod, puis <b>recrée le pod</b> : "
+            "modifier un template ne change pas l'environnement d'un pod déjà lancé."
+        )
 
     @pyqtSlot(str)
     def _on_health_failed(self, message: str) -> None:
@@ -757,6 +791,8 @@ class MainWindow(QMainWindow):
         if not source.exists():
             QMessageBox.warning(self, "miniDS", "Choisis une vidéo ou un dossier d'images existant.")
             return
+        if not self._confirm_despite_missing_model_access():
+            return
 
         self._save_settings()
         request = ScanRequest(
@@ -771,6 +807,26 @@ class MainWindow(QMainWindow):
             fetch_all=self.fetch_all_check.isChecked(),
         )
         self._launch(request, source.name)
+
+    def _confirm_despite_missing_model_access(self) -> bool:
+        """Prévient avant de payer un scan condamné à échouer sur `vggt`.
+
+        Le dernier test de connexion a vu qu'il manquait un identifiant au pod.
+        On n'interdit pas — le pod a pu être corrigé entre-temps — mais le défaut
+        est de ne pas lancer.
+        """
+        if not self._model_access_warning:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "miniDS",
+            "Au dernier test de connexion, le pod ne pouvait pas accéder aux poids du modèle :\n\n"
+            "le scan ira jusqu'à l'étape « vggt » avant d'échouer, GPU facturé.\n\n"
+            "Lancer quand même ?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def browse_jobs(self) -> None:
         """Demande la liste des jobs au pod, hors du fil graphique."""

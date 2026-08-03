@@ -369,6 +369,47 @@ def test_a_crash_mid_scan_leaves_the_job_reachable(
     window.close()
 
 
+def test_a_pod_without_model_credentials_is_flagged_before_scanning(
+    qapp, tmp_path, isolated_store, monkeypatch
+):
+    """Un scan condamné à échouer sur `vggt` ne doit pas partir sans avertissement."""
+    from PyQt6.QtWidgets import QMessageBox
+
+    from gui.main_window import MainWindow
+
+    window = MainWindow()
+    window.url_edit.setText("http://pod")
+    window.token_edit.setText("jeton")
+    window.source_edit.setText(str(tmp_path))
+
+    window._on_health_ok(
+        {"cuda_available": True, "hf_token_configured": False, "checkpoint": "facebook/X:y.pt"}
+    )
+    assert "HF_TOKEN" in window._model_access_warning
+
+    asked: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: (asked.append(args[2]), QMessageBox.StandardButton.No)[1],
+    )
+    window.start_scan()
+
+    assert asked and "vggt" in asked[0]
+    assert window.scan_worker is None, "le scan ne doit pas partir sur un refus"
+
+    # Un pod correctement configuré ne pose aucune question.
+    window._on_health_ok(
+        {"cuda_available": True, "hf_token_configured": True, "checkpoint": "facebook/X:y.pt"}
+    )
+    assert window._model_access_warning == ""
+
+    # Un pod d'une version antérieure ne publie pas ces champs : pas d'alerte inventée.
+    window._on_health_ok({"cuda_available": True})
+    assert window._model_access_warning == ""
+    window.close()
+
+
 def test_cancelled_scan_is_not_reported_as_a_crash(qapp, tmp_path, isolated_store, monkeypatch):
     """Annuler est une décision, pas un incident : pas de boîte d'erreur."""
     from PyQt6.QtWidgets import QMessageBox

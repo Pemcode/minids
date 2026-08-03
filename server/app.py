@@ -111,6 +111,12 @@ def build_app(settings: Settings | None = None) -> FastAPI:
             "default_frames": settings.default_frames,
             "jobs": len(store.list()),
             "auth_configured": bool(settings.token),
+            # Les deux réglages sans lesquels l'étape `vggt` échoue. Les exposer
+            # ici permet de le voir avant de lancer un scan, plutôt qu'après cinq
+            # étapes de pipeline sur un GPU facturé. Seule leur présence est
+            # publiée : `HF_TOKEN` est un secret.
+            "hf_token_configured": bool(settings.hf_token),
+            "checkpoint": settings.checkpoint,
         }
         try:  # pragma: no cover - dépend du GPU
             import torch

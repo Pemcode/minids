@@ -7,6 +7,7 @@ chemin réseau que le client empruntera sur le pod.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from pathlib import Path
 
@@ -63,6 +64,28 @@ def test_health_reports_fake_mode(app):
     assert body["status"] == "ok"
     assert body["fake_gpu"] is True
     assert body["auth_configured"] is True
+
+
+def test_health_reports_missing_model_credentials(settings):
+    """Sans HF_TOKEN, le job ne meurt qu'à l'étape `vggt`, GPU déjà facturé.
+
+    `/health` doit donc le dire d'avance — sans publier le secret lui-même.
+    """
+    from dataclasses import replace
+
+    from server.app import build_app
+
+    with TestClient(build_app(replace(settings, fake_gpu=False))) as client:
+        body = client.get("/health").json()
+    assert body["hf_token_configured"] is False
+    assert body["checkpoint"] == ""
+
+    configured = replace(settings, fake_gpu=False, hf_token="hf_secret", checkpoint="facebook/X:y.pt")
+    with TestClient(build_app(configured)) as client:
+        body = client.get("/health").json()
+    assert body["hf_token_configured"] is True
+    assert body["checkpoint"] == "facebook/X:y.pt"
+    assert "hf_secret" not in json.dumps(body), "le jeton ne doit jamais être publié"
 
 
 def test_authentication_is_required(app):

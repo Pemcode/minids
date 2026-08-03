@@ -26,8 +26,15 @@ if [ -z "${MINIDS_TOKEN:-}" ]; then
 fi
 
 echo "miniDS — données: $DATA_DIR | port: $PORT | fake_gpu: ${MINIDS_FAKE_GPU:-0}"
-if [ -z "${MINIDS_CKPT:-}" ] && [ "${MINIDS_FAKE_GPU:-0}" != "1" ]; then
-    echo "ATTENTION: MINIDS_CKPT vide — renseigner un chemin local ou 'repo_id:fichier' Hugging Face."
+if [ "${MINIDS_FAKE_GPU:-0}" != "1" ]; then
+    if [ -z "${MINIDS_CKPT:-}" ]; then
+        echo "ATTENTION: MINIDS_CKPT vide — renseigner un chemin local ou 'repo_id:fichier' Hugging Face."
+    fi
+    # Les poids VGGT-Ω sont sous accès restreint : sans jeton, le job ne meurt
+    # qu'à l'étape vggt, après cinq étapes déjà facturées.
+    if [ -z "${HF_TOKEN:-}" ]; then
+        echo "ATTENTION: HF_TOKEN vide — le téléchargement des poids VGGT-Ω échouera (401 « Please log in »)."
+    fi
 fi
 
 python - <<'PY' || true

@@ -9,3 +9,9 @@ __pycache__/
 *.part
 .ruff_cache/
 minids.env.ps1
+
+# Vidéos de test posées à la racine du dépôt.
+*.mp4
+*.mov
+*.mkv
+*.webm
