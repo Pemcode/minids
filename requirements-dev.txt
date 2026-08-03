@@ -21,3 +21,9 @@ tqdm>=4.66
 #     .\.venv312\Scripts\python.exe -m pip install -r requirements-dev.txt open3d xatlas
 open3d>=0.18; python_version < "3.13"
 xatlas>=0.0.9; python_version < "3.13"
+
+# tests/test_refine_2dgs.py vérifie les formes de tenseurs passées à gsplat —
+# sur CPU, sans GPU ni gsplat. Volontairement hors de cette liste : le paquet
+# torch de PyPI embarque CUDA (plusieurs Go). Pour l'activer :
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Sans lui, ces tests sont ignorés.

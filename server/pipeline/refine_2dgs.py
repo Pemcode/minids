@@ -163,6 +163,17 @@ class GaussianModel:
         return self.means.shape[0]
 
     def render_parameters(self) -> dict[str, Any]:
+        """Paramètres activés, prêts pour `rasterization_2dgs`.
+
+        Les couleurs sortent en **(1, N, 3)** et non (N, 3), bien que gsplat
+        accepte les deux dans ses assertions. En mode `RGB+ED` il exécute
+        `torch.cat((colors, depths[..., None]), dim=-1)` avec `depths` en
+        (C, N) : une couleur en (N, 3) fait donc échouer la concaténation
+        (« Tensors must have same number of dimensions: got 2 and 3 »). Le code
+        qui étendait (N, D) en (C, N, D) est commenté dans gsplat 1.5.3.
+
+        Nos deux appels rendent exactement une vue à la fois, d'où C = 1.
+        """
         import torch
 
         return {
@@ -170,7 +181,7 @@ class GaussianModel:
             "quats": torch.nn.functional.normalize(self.quats, dim=-1),
             "scales": torch.exp(self.scales),
             "opacities": torch.sigmoid(self.opacities),
-            "colors": torch.sigmoid(self.colors),
+            "colors": torch.sigmoid(self.colors)[None],
         }
 
     # -- contrôle adaptatif de densité ---------------------------------
