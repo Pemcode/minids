@@ -78,12 +78,15 @@ dimension réelle, en mètres).
 
 Le proxy RunPod passe par Cloudflare, qui **coupe toute connexion à 100 s**. Une
 inférence de 15 minutes ne peut donc pas être une requête HTTP synchrone, et un
-upload de vidéo 4K non plus.
+upload de vidéo 4K non plus. Le lancement assemble, vérifie l'empreinte et
+inspecte l'archive avant la mise en file : sur un très gros upload, sa réponse
+peut elle aussi dépasser le délai. Le client récupère alors l'état par un `GET`
+idempotent et ne rejoue jamais aveuglément le `POST`.
 
 | Étape | Appel | Pourquoi ça passe |
 |---|---|---|
 | upload | `POST /jobs` puis `PUT /jobs/{id}/chunks/{n}` (8 Mo) | chaque chunk très en-deçà de 100 s, et repris individuellement |
-| lancement | `POST /jobs/{id}/start` | retour immédiat, traitement en tâche de fond |
+| lancement | `POST /jobs/{id}/start`, puis récupération possible par `GET` | réservation atomique ; l'assemblage peut durer proportionnellement à l'upload, puis le GPU travaille en tâche de fond |
 | suivi | `GET /jobs/{id}` toutes les 5 s | JSON minuscule |
 | récupération | `GET /jobs/{id}/artifacts/{nom}` avec `Range:` | reprise depuis le `.part`, vérification sha256 |
 
@@ -135,7 +138,7 @@ Options utiles de `run` :
 
 | Option | Effet |
 |---|---|
-| `--frames 120` | images envoyées au modèle (100 pour rester large sur 24 Go) |
+| `--frames 120` | images envoyées au modèle ; réduire vers 100 pour garder davantage de marge sur 24 Go |
 | `--no-refine` | saute le 2DGS : ~1 min au lieu de ~15, qualité en retrait |
 | `--backends tsdf2dgs,tsdf,poisson` | produit plusieurs maillages pour comparer |
 | `--ref-size 0.28` | met le GLB à l'échelle métrique réelle |
@@ -199,12 +202,14 @@ Ce sont eux qui font la différence, bien plus que les hyperparamètres :
 # Open3D n'a pas de wheel Python 3.13 : le venv de test est en 3.12.
 py -3.12 -m venv .venv312
 .\.venv312\Scripts\python.exe -m pip install -r requirements-dev.txt
-.\.venv312\Scripts\python.exe -m pytest tests/        # 70 tests
+.\.venv312\Scripts\python.exe -m ruff check .
+.\.venv312\Scripts\python.exe -m ruff format --check .
+.\.venv312\Scripts\python.exe -m pytest --cov --cov-report=term-missing
 ```
 
-En Python 3.13, les deux fichiers de test qui dépendent d'Open3D sont ignorés
-automatiquement (59 tests restants). Les 18 tests d'interface le sont aussi si
-PyQt6 est absent — ils tournent sans écran, via `QT_QPA_PLATFORM=offscreen`.
+En Python 3.13, les tests qui dépendent d'Open3D sont ignorés automatiquement.
+Les tests d'interface le sont aussi si PyQt6 est absent — ils tournent sans
+écran, via `QT_QPA_PLATFORM=offscreen`.
 
 Le mode `MINIDS_FAKE_GPU=1` rejoue les 10 étapes, la progression et les
 artefacts sans GPU ni modèle — il sert à valider tout le transport avant de
@@ -220,14 +225,14 @@ python client/minids.py run video.mp4
 
 ### Ce qui est vérifié, et ce qui ne peut pas l'être ici
 
-**70 tests passent sur cette machine.** Les plus utiles reposent sur une vérité
-terrain synthétique : un objet connu (sphère + boîte), des caméras en orbite, des
-profondeurs rendues exactement — ce qui permet de mesurer l'erreur du *code*,
-sans modèle. Sont couverts ainsi la fusion TSDF (Chamfer < 1 % de la diagonale),
-Poisson, le nettoyage (un îlot parasite ajouté doit disparaître), le bake de
-texture (l'objet est peint par une fonction `f(position)` connue, et l'on vérifie
-que la texture obtenue redonne bien `f` au bon endroit), et le re-maillage local
-depuis `vggt_raw.npz` jusqu'au GLB à l'échelle métrique.
+Les tests les plus utiles reposent sur une vérité terrain synthétique : un objet
+connu (sphère + boîte), des caméras en orbite, des profondeurs rendues exactement
+— ce qui permet de mesurer l'erreur du *code*, sans modèle. Sont couverts ainsi
+la fusion TSDF (Chamfer < 1 % de la diagonale), Poisson, le nettoyage (un îlot
+parasite ajouté doit disparaître), le bake de texture (l'objet est peint par une
+fonction `f(position)` connue, et l'on vérifie que la texture obtenue redonne bien
+`f` au bon endroit), et le re-maillage local depuis `vggt_raw.npz` jusqu'au GLB à
+l'échelle métrique.
 
 Le reste : géométrie caméra, conformité du GLB (alignement des chunks, conversion
 d'axes, PNG relu octet à octet, validation par un parseur glTF tiers), sélection
@@ -259,8 +264,10 @@ premier run réel :
 - `server/pipeline/refine_2dgs.py` — `_unpack_render` tolère les variantes de
   signature de `rasterization_2dgs`.
 
-Aucun de ces trois points ne fait perdre un scan : le repli est prévu, et
-`vggt_raw.npz` est écrit **avant** les étapes lourdes.
+SAM 3 dispose d'un repli géométrique. En revanche, une incompatibilité VGGT-Ω
+reste bloquante, et `vggt_raw.npz` n'est écrit qu'après VGGT-Ω et la segmentation.
+Le premier lancement réel doit donc être fait avec le préréglage de validation
+avant d'engager un scan long.
 
 ---
 

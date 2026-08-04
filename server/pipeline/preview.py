@@ -24,12 +24,32 @@ def render(
     import open3d as o3d
     import open3d.core as o3c
 
+    if not isinstance(height, (int, np.integer)) or isinstance(height, (bool, np.bool_)) or height <= 0:
+        raise ValueError(f"hauteur d'aperçu invalide: {height!r}")
+    if not isinstance(width, (int, np.integer)) or isinstance(width, (bool, np.bool_)) or width <= 0:
+        raise ValueError(f"largeur d'aperçu invalide: {width!r}")
+    intrinsics = np.asarray(intrinsics)
+    extrinsics = np.asarray(extrinsics)
+    if intrinsics.ndim != 3 or intrinsics.shape[1:] != (3, 3):
+        raise ValueError(f"intrinsèques d'aperçu invalides: {intrinsics.shape}")
+    if extrinsics.shape != (len(intrinsics), 4, 4) or not len(extrinsics):
+        raise ValueError(f"extrinsèques d'aperçu invalides: {extrinsics.shape}")
+    if not np.isfinite(intrinsics).all() or not np.isfinite(extrinsics).all():
+        raise ValueError("caméras d'aperçu non finies")
+
     if not len(mesh.triangles):
         return np.zeros((height, width, 3), dtype=np.uint8)
 
     count = len(extrinsics)
     if view_indices is None:
-        view_indices = [int(round(i * count / 4.0)) % count for i in range(4)]
+        tile_count = min(4, count)
+        view_indices = np.linspace(0, count - 1, tile_count).round().astype(int).tolist()
+    if not view_indices:
+        raise ValueError("aucune vue demandée pour l'aperçu")
+    if any(not isinstance(index, (int, np.integer)) or isinstance(index, (bool, np.bool_)) for index in view_indices):
+        raise ValueError(f"indices de vue invalides: {view_indices!r}")
+    if any(index < 0 or index >= count for index in view_indices):
+        raise IndexError(f"indice de vue hors bornes pour {count} caméras: {view_indices!r}")
 
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
@@ -60,6 +80,10 @@ def render(
 def _resize_intrinsic(intrinsic: np.ndarray, height: int, width: int) -> np.ndarray:
     """Recadre les intrinsèques sur la taille de l'aperçu (approximation carrée)."""
     scaled = np.array(intrinsic, dtype=np.float64, copy=True)
+    if scaled.shape != (3, 3) or not np.isfinite(scaled).all():
+        raise ValueError(f"intrinsèques invalides: {scaled.shape}")
+    if abs(scaled[0, 0]) <= 1e-12 or abs(scaled[1, 1]) <= 1e-12:
+        raise ValueError("focale nulle pour l'aperçu")
     source_cx, source_cy = scaled[0, 2], scaled[1, 2]
     scale_x = width / (2.0 * source_cx) if source_cx > 0 else 1.0
     scale_y = height / (2.0 * source_cy) if source_cy > 0 else 1.0

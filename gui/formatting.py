@@ -7,33 +7,39 @@ terminal, donc des mesures comparables entre la CLI et l'interface.
 
 from __future__ import annotations
 
+import math
+
 from tqdm.std import tqdm
 
 
 def duration(seconds: float | None) -> str:
     """`92.4` → `01:32`. Renvoie `—` si la durée est inconnue."""
-    if seconds is None or seconds < 0:
+    value = _number(seconds)
+    if value is None or value < 0:
         return "—"
-    return tqdm.format_interval(int(round(seconds)))
+    return tqdm.format_interval(round(value))
 
 
 def size(num_bytes: float | None) -> str:
     """`8388608` → `8.39M`."""
-    if num_bytes is None:
+    value = _number(num_bytes)
+    if value is None or value < 0:
         return "—"
-    return f"{tqdm.format_sizeof(float(num_bytes), 'o')}"
+    return f"{tqdm.format_sizeof(value, 'o')}"
 
 
 def rate(bytes_per_second: float | None) -> str:
-    if not bytes_per_second or bytes_per_second <= 0:
+    value = _number(bytes_per_second)
+    if value is None or value <= 0:
         return "—"
-    return f"{tqdm.format_sizeof(bytes_per_second, 'o')}/s"
+    return f"{tqdm.format_sizeof(value, 'o')}/s"
 
 
 def percent(fraction: float | None) -> str:
-    if fraction is None:
+    value = _number(fraction)
+    if value is None:
         return "—"
-    return f"{fraction * 100:.1f} %"
+    return f"{value * 100:.1f} %"
 
 
 def boolean(value: object) -> str:
@@ -44,11 +50,19 @@ def boolean(value: object) -> str:
 
 def compact_number(value: float | int | None) -> str:
     """`203451` → `203 k`, pour les compteurs de triangles et de gaussiennes."""
-    if value is None:
+    numeric = _number(value)
+    if numeric is None:
         return "—"
-    value = float(value)
-    if abs(value) >= 1e6:
-        return f"{value / 1e6:.2f} M"
-    if abs(value) >= 1e3:
-        return f"{value / 1e3:.0f} k"
-    return f"{value:.0f}"
+    if abs(numeric) >= 1e6:
+        return f"{numeric / 1e6:.2f} M"
+    if abs(numeric) >= 1e3:
+        return f"{numeric / 1e3:.0f} k"
+    return f"{numeric:.0f}"
+
+
+def _number(value: object) -> float | None:
+    try:
+        numeric = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None

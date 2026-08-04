@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import html
+import importlib.util
+import math
 import os
 import subprocess
 import sys
@@ -38,6 +41,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from client.transport import MinidsError, validate_job_id
+
 from . import theme
 from .formatting import boolean, compact_number, duration, percent, rate, size
 from .store import History, Settings, record_from_outcome
@@ -49,13 +54,40 @@ VIDEO_FILTER = "Vidéos et images (*.mp4 *.mov *.m4v *.mkv *.avi *.webm);;Tous l
 # Réglages recommandés : valider la chaîne avant de payer un raffinement de 15 min.
 PRESETS: dict[str, dict[str, Any]] = {
     "Validation rapide  (~2 min)": {
-        "frames": 100, "refine": False, "backend": "tsdf", "compare": False, "texture": "vertex",
+        "frames": 100,
+        "refine": False,
+        "backend": "tsdf",
+        "compare": False,
+        "texture": "vertex",
+        "gs_iters": 12000,
+        "texture_size": 2048,
+        "target_triangles": 200000,
+        "voxel_divisor": 512,
+        "watertight": True,
     },
     "Qualité maximale  (~15 min)": {
-        "frames": 120, "refine": True, "backend": "tsdf2dgs", "compare": False, "texture": "bake",
+        "frames": 120,
+        "refine": True,
+        "backend": "tsdf2dgs",
+        "compare": False,
+        "texture": "bake",
+        "gs_iters": 12000,
+        "texture_size": 2048,
+        "target_triangles": 200000,
+        "voxel_divisor": 512,
+        "watertight": True,
     },
     "Comparatif de backends  (~18 min)": {
-        "frames": 120, "refine": True, "backend": "tsdf2dgs", "compare": True, "texture": "bake",
+        "frames": 120,
+        "refine": True,
+        "backend": "tsdf2dgs",
+        "compare": True,
+        "texture": "bake",
+        "gs_iters": 12000,
+        "texture_size": 2048,
+        "target_triangles": 200000,
+        "voxel_divisor": 512,
+        "watertight": True,
     },
     "Personnalisé": {},
 }
@@ -77,6 +109,7 @@ class MainWindow(QMainWindow):
         self._loading_preset = False
         self._source_label = ""
         self._model_access_warning = ""
+        self._close_requested = False
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_connection_tab(), "Connexion")
@@ -116,16 +149,13 @@ class MainWindow(QMainWindow):
         token_row = QWidget()
         token_layout = QHBoxLayout(token_row)
         token_layout.setContentsMargins(0, 0, 0, 0)
-        show_token = QPushButton("Afficher")
-        show_token.setCheckable(True)
-        show_token.setMaximumWidth(90)
-        show_token.toggled.connect(
-            lambda on: self.token_edit.setEchoMode(
-                QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password
-            )
-        )
+        self.show_token_button = QPushButton("Afficher")
+        self.show_token_button.setCheckable(True)
+        self.show_token_button.setMaximumWidth(90)
+        self.show_token_button.setAccessibleName("Afficher ou masquer le jeton")
+        self.show_token_button.toggled.connect(self._toggle_token_visibility)
         token_layout.addWidget(self.token_edit)
-        token_layout.addWidget(show_token)
+        token_layout.addWidget(self.show_token_button)
 
         self.remember_token = QCheckBox("Mémoriser le jeton")
         self.remember_token.setToolTip(
@@ -163,6 +193,7 @@ class MainWindow(QMainWindow):
 
         self.health_detail = QLabel("Aucun test effectué.")
         self.health_detail.setWordWrap(True)
+        self.health_detail.setTextFormat(Qt.TextFormat.RichText)
         self.health_detail.setStyleSheet(f"color:{theme.TEXT_DIM};")
         health_layout.addWidget(self.health_detail)
         layout.addWidget(health_box)
@@ -172,8 +203,10 @@ class MainWindow(QMainWindow):
             "<b>401</b> : le jeton ne correspond pas à celui du pod.<br>"
             "<b>503</b> : aucun <code>MINIDS_TOKEN</code> n'est configuré côté pod."
         )
-        hint.setStyleSheet(f"color:{theme.TEXT_DIM}; background:{theme.SURFACE_HIGH};"
-                           f"border:1px solid {theme.BORDER}; border-radius:8px; padding:12px;")
+        hint.setStyleSheet(
+            f"color:{theme.TEXT_DIM}; background:{theme.SURFACE_HIGH};"
+            f"border:1px solid {theme.BORDER}; border-radius:8px; padding:12px;"
+        )
         layout.addWidget(hint)
         layout.addStretch(1)
         return page
@@ -219,9 +252,8 @@ class MainWindow(QMainWindow):
         self.frames_spin = QSpinBox()
         self.frames_spin.setRange(20, 600)
         self.frames_spin.setSingleStep(10)
-        self.frames_spin.setToolTip(
-            "120 images ≈ 16 Go de VRAM. Au-delà de 200, il faut plus de 24 Go."
-        )
+        self.frames_spin.setToolTip("120 images ≈ 16 Go de VRAM. Au-delà de 200, il faut plus de 24 Go.")
+        self.frames_spin.valueChanged.connect(self._on_manual_change)
         source_form.addRow("Images envoyées", self.frames_spin)
 
         self.long_side_spin = QSpinBox()
@@ -238,7 +270,7 @@ class MainWindow(QMainWindow):
         object_box = QGroupBox("Objet")
         object_form = self._form(object_box, stacked=True)
         self.prompt_edit = QLineEdit()
-        self.prompt_edit.setPlaceholderText('the sneaker')
+        self.prompt_edit.setPlaceholderText("the sneaker")
         self.prompt_edit.setToolTip("Prompt texte SAM 3. Vide → segmentation géométrique.")
         object_form.addRow("Prompt SAM 3", self.prompt_edit)
 
@@ -267,11 +299,13 @@ class MainWindow(QMainWindow):
             "C'est ce qui distingue un maillage propre d'un maillage bruité — mais coûte ~12 min."
         )
         self.refine_check.toggled.connect(self._on_manual_change)
+        self.refine_check.toggled.connect(self._sync_quality_controls)
         quality_form.addRow(self.refine_check)
 
         self.gs_iters_spin = QSpinBox()
         self.gs_iters_spin.setRange(500, 60000)
         self.gs_iters_spin.setSingleStep(1000)
+        self.gs_iters_spin.valueChanged.connect(self._on_manual_change)
         quality_form.addRow("Itérations 2DGS", self.gs_iters_spin)
 
         self.backend_combo = QComboBox()
@@ -295,12 +329,14 @@ class MainWindow(QMainWindow):
         self.target_tris_spin.setRange(5000, 2000000)
         self.target_tris_spin.setSingleStep(50000)
         self.target_tris_spin.setGroupSeparatorShown(True)
+        self.target_tris_spin.valueChanged.connect(self._on_manual_change)
         mesh_form.addRow("Triangles visés", self.target_tris_spin)
 
         self.voxel_spin = QSpinBox()
         self.voxel_spin.setRange(64, 2048)
         self.voxel_spin.setSingleStep(64)
         self.voxel_spin.setToolTip("Diagonale de l'objet ÷ ce nombre = taille de voxel TSDF.")
+        self.voxel_spin.valueChanged.connect(self._on_manual_change)
         mesh_form.addRow("Diviseur de voxel", self.voxel_spin)
 
         self.texture_combo = QComboBox()
@@ -310,12 +346,12 @@ class MainWindow(QMainWindow):
 
         self.texture_size_combo = QComboBox()
         self.texture_size_combo.addItems(["1024", "2048", "4096"])
+        self.texture_size_combo.currentTextChanged.connect(self._on_manual_change)
         mesh_form.addRow("Taille de texture", self.texture_size_combo)
 
         self.watertight_check = QCheckBox("Boucher les trous")
+        self.watertight_check.toggled.connect(self._on_manual_change)
         mesh_form.addRow(self.watertight_check)
-        self.ba_check = QCheckBox("Ajustement de faisceaux")
-        mesh_form.addRow(self.ba_check)
         form_layout.addWidget(mesh_box)
 
         output_box = QGroupBox("Sortie")
@@ -445,6 +481,7 @@ class MainWindow(QMainWindow):
         preview_box = QGroupBox("Aperçu (rendu par lancer de rayons)")
         preview_layout = QVBoxLayout(preview_box)
         self.preview = PreviewPane()
+        self.preview.clicked.connect(self._open_preview)
         preview_layout.addWidget(self.preview)
         middle.addWidget(preview_box, 3)
 
@@ -454,6 +491,9 @@ class MainWindow(QMainWindow):
         self.artifacts_table.setHorizontalHeaderLabels(["Fichier", "Taille"])
         self.artifacts_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.artifacts_table.verticalHeader().setVisible(False)
+        self.artifacts_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.artifacts_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.artifacts_table.setAccessibleName("Artefacts récupérés")
         artifacts_layout.addWidget(self.artifacts_table)
         middle.addWidget(artifacts_box, 2)
         layout.addLayout(middle, 1)
@@ -509,6 +549,9 @@ class MainWindow(QMainWindow):
         self.history_table.verticalHeader().setVisible(False)
         self.history_table.setAlternatingRowColors(True)
         self.history_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.history_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.history_table.setAccessibleName("Historique des scans")
         self.history_table.itemSelectionChanged.connect(self._on_history_selection)
         layout.addWidget(self.history_table, 1)
 
@@ -576,7 +619,7 @@ class MainWindow(QMainWindow):
         self.token_edit.setText(settings.token or os.environ.get("MINIDS_TOKEN", ""))
         self.remember_token.setChecked(settings.remember_token)
         self.output_edit.setText(settings.output_dir or str(Path.cwd() / "out"))
-        self.long_side_spin.setValue(settings.long_side)
+        self.long_side_spin.setValue(settings.long_side if settings.long_side % 2 == 0 else 1024)
         self.send_video_check.setChecked(settings.send_video)
         self.fetch_raw_check.setChecked(settings.fetch_raw)
         # Un job resté en cours à la dernière fermeture : proposé d'emblée.
@@ -584,27 +627,35 @@ class MainWindow(QMainWindow):
 
         params = settings.params or {}
         self._loading_preset = True
-        self.frames_spin.setValue(int(params.get("frames") or 120))
-        self.prompt_edit.setText(params.get("prompt") or "")
-        self.segmentation_combo.setCurrentText(params.get("segmentation", "auto"))
+        self.frames_spin.setValue(_bounded_int(params.get("frames"), 120, 20, 600))
+        prompt = params.get("prompt")
+        self.prompt_edit.setText(prompt if isinstance(prompt, str) else "")
+        self.segmentation_combo.setCurrentText(
+            _choice(params.get("segmentation"), {"auto", "sam3", "geometric", "none"}, "auto")
+        )
         self.refine_check.setChecked(bool(params.get("refine", True)))
-        self.gs_iters_spin.setValue(int(params.get("gs_iters") or 12000))
-        backends = params.get("mesh_backends") or ["tsdf2dgs"]
-        self.backend_combo.setCurrentText(backends[0])
+        self.gs_iters_spin.setValue(_bounded_int(params.get("gs_iters"), 12000, 500, 60000))
+        raw_backends = params.get("mesh_backends")
+        backends = raw_backends if isinstance(raw_backends, list) and raw_backends else ["tsdf2dgs"]
+        self.backend_combo.setCurrentText(_choice(backends[0], {"tsdf2dgs", "tsdf", "poisson"}, "tsdf2dgs"))
         self.compare_check.setChecked(len(backends) > 1)
-        self.texture_combo.setCurrentText(params.get("texture", "bake"))
-        self.texture_size_combo.setCurrentText(str(params.get("texture_size", 2048)))
-        self.target_tris_spin.setValue(int(params.get("target_triangles") or 200000))
-        self.voxel_spin.setValue(int(params.get("voxel_divisor") or 512))
+        self.texture_combo.setCurrentText(_choice(params.get("texture"), {"bake", "vertex"}, "bake"))
+        self.texture_size_combo.setCurrentText(
+            str(_choice(str(params.get("texture_size", 2048)), {"1024", "2048", "4096"}, "2048"))
+        )
+        self.target_tris_spin.setValue(_bounded_int(params.get("target_triangles"), 200000, 5000, 2000000))
+        self.voxel_spin.setValue(_bounded_int(params.get("voxel_divisor"), 512, 64, 2048))
         self.watertight_check.setChecked(bool(params.get("watertight", True)))
-        self.ba_check.setChecked(bool(params.get("bundle_adjustment", False)))
-        ref = params.get("ref_size")
-        self.ref_size_spin.setValue(float(ref) if ref else 0.0)
+        self.ref_size_spin.setValue(_bounded_float(params.get("ref_size"), 0.0, 0.0, 100.0))
         self.preset_combo.setCurrentText("Personnalisé" if params else "Qualité maximale  (~15 min)")
         self._loading_preset = False
+        self._sync_quality_controls(self.refine_check.isChecked())
 
     def _collect_params(self) -> dict[str, Any]:
-        backends = [self.backend_combo.currentText()]
+        primary = self.backend_combo.currentText()
+        if not self.refine_check.isChecked() and primary == "tsdf2dgs":
+            primary = "tsdf"
+        backends = [primary]
         if self.compare_check.isChecked():
             backends += [b for b in ("tsdf2dgs", "tsdf", "poisson") if b not in backends]
             if not self.refine_check.isChecked():
@@ -621,7 +672,6 @@ class MainWindow(QMainWindow):
             "target_triangles": self.target_tris_spin.value(),
             "voxel_divisor": self.voxel_spin.value(),
             "ref_size": self.ref_size_spin.value() or None,
-            "bundle_adjustment": self.ba_check.isChecked(),
             "watertight": self.watertight_check.isChecked(),
         }
 
@@ -634,12 +684,24 @@ class MainWindow(QMainWindow):
         self.settings.send_video = self.send_video_check.isChecked()
         self.settings.fetch_raw = self.fetch_raw_check.isChecked()
         self.settings.params = self._collect_params()
-        self.settings.save()
+        try:
+            self.settings.save()
+        except OSError as exc:
+            self.statusBar().showMessage(f"Réglages non enregistrés : {exc}", 10000)
 
     def _load_from_env(self) -> None:
         self.url_edit.setText(os.environ.get("MINIDS_URL", ""))
         self.token_edit.setText(os.environ.get("MINIDS_TOKEN", ""))
         self.statusBar().showMessage("Valeurs reprises de l'environnement", 4000)
+
+    def _toggle_token_visibility(self, visible: bool) -> None:
+        self.token_edit.setEchoMode(QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password)
+        self.show_token_button.setText("Masquer" if visible else "Afficher")
+
+    def _sync_quality_controls(self, refine: bool) -> None:
+        self.gs_iters_spin.setEnabled(refine)
+        if not refine and self.backend_combo.currentText() == "tsdf2dgs":
+            self.backend_combo.setCurrentText("tsdf")
 
     def _apply_preset(self, name: str) -> None:
         preset = PRESETS.get(name) or {}
@@ -651,6 +713,11 @@ class MainWindow(QMainWindow):
         self.backend_combo.setCurrentText(preset["backend"])
         self.compare_check.setChecked(preset["compare"])
         self.texture_combo.setCurrentText(preset["texture"])
+        self.gs_iters_spin.setValue(preset["gs_iters"])
+        self.texture_size_combo.setCurrentText(str(preset["texture_size"]))
+        self.target_tris_spin.setValue(preset["target_triangles"])
+        self.voxel_spin.setValue(preset["voxel_divisor"])
+        self.watertight_check.setChecked(preset["watertight"])
         self._loading_preset = False
 
     def _on_manual_change(self, *_args) -> None:
@@ -694,6 +761,7 @@ class MainWindow(QMainWindow):
         self.health_worker.succeeded.connect(self._on_health_ok)
         self.health_worker.failed.connect(self._on_health_failed)
         self.health_worker.finished.connect(lambda: self.test_button.setEnabled(True))
+        self.health_worker.finished.connect(self._maybe_finish_close)
         self.health_worker.start()
 
     @pyqtSlot(dict)
@@ -702,12 +770,8 @@ class MainWindow(QMainWindow):
         self.card_gpu.set_value(str(info.get("gpu", "—")))
         free = info.get("vram_free_gb")
         total = info.get("vram_total_gb")
-        self.card_vram.set_value(
-            f"{free} Go" if free else "—", f"sur {total} Go" if total else ""
-        )
-        self.card_cuda.set_value(
-            boolean(cuda), str(info.get("torch", "")), theme.SUCCESS if cuda else theme.WARNING
-        )
+        self.card_vram.set_value(f"{free} Go" if free else "—", f"sur {total} Go" if total else "")
+        self.card_cuda.set_value(boolean(cuda), str(info.get("torch", "")), theme.SUCCESS if cuda else theme.WARNING)
         self.card_version.set_value(str(info.get("version", "—")))
 
         # Un scan atteint l'étape `vggt` après cinq étapes déjà facturées. Si les
@@ -744,23 +808,24 @@ class MainWindow(QMainWindow):
                 "<b>HF_TOKEN</b> n'est pas défini sur le pod — les poids VGGT-Ω sont sous accès "
                 "restreint, et le job échouera à l'étape <code>vggt</code> avec « Please log in »."
             )
-        if "checkpoint" in info and not info["checkpoint"]:
+        checkpoint_missing = ("checkpoint_configured" in info and not bool(info["checkpoint_configured"])) or (
+            "checkpoint_configured" not in info and "checkpoint" in info and not info["checkpoint"]
+        )
+        if checkpoint_missing:
             missing.append(
-                "<b>MINIDS_CKPT</b> est vide — attendu : "
-                "<code>facebook/VGGT-Omega:vggt_omega_1b_512.pt</code>."
+                "<b>MINIDS_CKPT</b> est vide — attendu : <code>facebook/VGGT-Omega:vggt_omega_1b_512.pt</code>."
             )
         if not missing:
             return ""
         return (
-            "<br>".join(missing)
-            + "<br><br>Corrige les variables du template RunPod, puis <b>recrée le pod</b> : "
+            "<br>".join(missing) + "<br><br>Corrige les variables du template RunPod, puis <b>recrée le pod</b> : "
             "modifier un template ne change pas l'environnement d'un pod déjà lancé."
         )
 
     @pyqtSlot(str)
     def _on_health_failed(self, message: str) -> None:
         self.status_dot.set_state("échec", theme.DANGER)
-        self.health_detail.setText(message)
+        self.health_detail.setText(html.escape(message))
         for card in (self.card_gpu, self.card_vram, self.card_cuda, self.card_version):
             card.set_value("—")
 
@@ -787,19 +852,27 @@ class MainWindow(QMainWindow):
         if connection is None:
             return
         url, token = connection
-        source = Path(self.source_edit.text().strip())
-        if not source.exists():
+        source = Path(self.source_edit.text().strip()).expanduser()
+        if not source.is_file() and not source.is_dir():
             QMessageBox.warning(self, "miniDS", "Choisis une vidéo ou un dossier d'images existant.")
+            return
+        if self.segmentation_combo.currentText() == "sam3" and not self.prompt_edit.text().strip():
+            QMessageBox.warning(self, "miniDS", "La segmentation SAM 3 exige un prompt texte non vide.")
+            return
+        output_dir = Path(self.output_edit.text().strip() or "out").expanduser()
+        if output_dir.exists() and not output_dir.is_dir():
+            QMessageBox.warning(self, "miniDS", "Le chemin de sortie existe mais n'est pas un dossier.")
             return
         if not self._confirm_despite_missing_model_access():
             return
 
+        self.settings.last_source_dir = str(source if source.is_dir() else source.parent)
         self._save_settings()
         request = ScanRequest(
             url=url,
             token=token,
             source=source,
-            output_dir=Path(self.output_edit.text().strip() or "out"),
+            output_dir=output_dir,
             params=self._collect_params(),
             long_side=self.long_side_spin.value(),
             send_video=self.send_video_check.isChecked(),
@@ -836,10 +909,9 @@ class MainWindow(QMainWindow):
         self.browse_jobs_button.setEnabled(False)
         self.job_list_worker = JobListWorker(*connection)
         self.job_list_worker.succeeded.connect(self._on_jobs_listed)
-        self.job_list_worker.failed.connect(
-            lambda message: QMessageBox.warning(self, "miniDS", message)
-        )
+        self.job_list_worker.failed.connect(lambda message: QMessageBox.warning(self, "miniDS", message))
         self.job_list_worker.finished.connect(lambda: self.browse_jobs_button.setEnabled(True))
+        self.job_list_worker.finished.connect(self._maybe_finish_close)
         self.job_list_worker.start()
 
     @pyqtSlot(list)
@@ -861,6 +933,11 @@ class MainWindow(QMainWindow):
         job_id = self.job_id_edit.text().strip()
         if not job_id:
             QMessageBox.warning(self, "miniDS", "Indique l'identifiant du job à rejoindre.")
+            return
+        try:
+            validate_job_id(job_id)
+        except MinidsError as exc:
+            QMessageBox.warning(self, "miniDS", str(exc))
             return
 
         self._save_settings()
@@ -915,7 +992,10 @@ class MainWindow(QMainWindow):
         # une fermeture brutale, sans avoir eu à noter l'identifiant.
         self.job_id_edit.setText(job_id)
         self.settings.last_job_id = job_id
-        self.settings.save()
+        try:
+            self.settings.save()
+        except OSError as exc:
+            self.statusBar().showMessage(f"Identifiant du job non enregistré : {exc}", 10000)
         self.statusBar().showMessage(f"job {job_id}", 8000)
 
     def cancel_scan(self) -> None:
@@ -929,20 +1009,24 @@ class MainWindow(QMainWindow):
         if phase in {"extraction", "attente"}:
             self.transfer_bar.setValue(0)
 
-    @pyqtSlot(str, int, int, float)
+    @pyqtSlot(str, object, object, float)
     def _on_transfer(self, label: str, done: int, total: int, speed: float) -> None:
-        fraction = done / total if total else 0.0
+        done = max(0, _bounded_int(done, 0, 0, 2**63 - 1))
+        total = max(0, _bounded_int(total, 0, 0, 2**63 - 1))
+        fraction = max(0.0, min(1.0, done / total if total else 0.0))
         self.transfer_bar.setValue(int(fraction * 1000))
         self.transfer_bar.setFormat(f"{label}  {size(done)} / {size(total)}  (%p%)")
         self.card_rate.set_value(rate(speed))
 
     @pyqtSlot(dict)
     def _on_server_state(self, state: dict) -> None:
-        self.server_bar.setValue(int(float(state.get("progress") or 0.0) * 1000))
+        progress = _bounded_float(state.get("progress"), 0.0, 0.0, 1.0)
+        self.server_bar.setValue(round(progress * 1000))
         stage = state.get("stage") or ""
         self.card_stage.set_value(stage or "—", state.get("status", ""))
-        self.card_eta.set_value(duration(state.get("eta_seconds")))
-        self.live_timeline.set_timings(state.get("stage_timings") or {}, stage)
+        self.card_eta.set_value(duration(_optional_float(state.get("eta_seconds"))))
+        timings = state.get("stage_timings") if isinstance(state.get("stage_timings"), dict) else {}
+        self.live_timeline.set_timings(timings, stage)
 
     def _tick_elapsed(self) -> None:
         self.card_elapsed.set_value(duration(time.time() - self._scan_started_at))
@@ -952,7 +1036,7 @@ class MainWindow(QMainWindow):
         self.phase_label.setText("terminé")
         self.server_bar.setValue(1000)
         self.last_outcome = outcome
-        self.history.add(record_from_outcome(outcome, self._source_label))
+        self._record_history(outcome)
         self._refresh_history_view()
         self._show_results(outcome)
         self.tabs.setCurrentIndex(2)
@@ -961,19 +1045,38 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(object)
     def _on_scan_failed(self, outcome) -> None:
+        if outcome.status == "detached":
+            self.phase_label.setText("détaché")
+            self.log_view.append_line("suivi local fermé — le job distant n'a pas été annulé")
+            self.statusBar().showMessage("Job non annulé ; son identifiant reste disponible pour le rejoindre", 10000)
+            return
+        if outcome.status == "download_interrupted":
+            self.phase_label.setText("téléchargement interrompu")
+            self.log_view.append_line(outcome.error)
+            self.statusBar().showMessage("Rejoins le job terminé pour reprendre les téléchargements", 10000)
+            return
         cancelled = outcome.status == "cancelled"
-        self.phase_label.setText("annulé" if cancelled else f"échec — {outcome.status}")
+        stopped_before_start = cancelled and outcome.error == "arrêté avant démarrage"
+        self.phase_label.setText(
+            "arrêté avant démarrage"
+            if stopped_before_start
+            else ("annulé" if cancelled else f"échec — {outcome.status}")
+        )
         if outcome.job_id:
-            self.history.add(record_from_outcome(outcome, self._source_label))
+            self._record_history(outcome)
             self._refresh_history_view()
 
         if cancelled:
             # Une annulation est une décision de l'utilisateur, pas un incident :
             # une boîte d'erreur lui ferait relire ce qu'il vient de demander.
-            self.log_view.append_line("scan annulé")
+            message = "scan arrêté avant démarrage" if stopped_before_start else "scan annulé"
+            self.log_view.append_line(message)
             self._forget_pending_job()
-            self.statusBar().showMessage("Scan annulé", 8000)
+            self.statusBar().showMessage(message.capitalize(), 8000)
             return
+
+        if outcome.status in {"failed", "cancelled"}:
+            self._forget_pending_job()
 
         self.log_view.append_line(f"ERREUR {outcome.error}")
         QMessageBox.critical(self, "miniDS", outcome.error or "Le scan a échoué.")
@@ -981,21 +1084,46 @@ class MainWindow(QMainWindow):
     def _forget_pending_job(self) -> None:
         """Le job n'est plus en cours : plus rien à reproposer au prochain démarrage."""
         self.settings.last_job_id = ""
-        self.settings.save()
+        try:
+            self.settings.save()
+        except OSError as exc:
+            self.statusBar().showMessage(f"État du job non enregistré : {exc}", 10000)
+
+    def _record_history(self, outcome: Any) -> None:
+        try:
+            self.history.add(record_from_outcome(outcome, self._source_label))
+        except (OSError, TypeError, ValueError) as exc:
+            self.statusBar().showMessage(f"Historique non enregistré : {exc}", 10000)
 
     def _on_worker_finished(self) -> None:
         self._elapsed_timer.stop()
         self.launch_button.setEnabled(True)
         self.attach_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
+        self._maybe_finish_close()
+
+    def _workers_running(self) -> bool:
+        return any(
+            worker is not None and worker.isRunning()
+            for worker in (self.scan_worker, self.health_worker, self.job_list_worker)
+        )
+
+    def _maybe_finish_close(self) -> None:
+        if self._close_requested and not self._workers_running():
+            QTimer.singleShot(0, self.close)
 
     # ------------------------------------------------------------------
     # Résultats
     # ------------------------------------------------------------------
     def _show_results(self, outcome) -> None:
-        report = outcome.report or {}
-        backend = report.get("primary_backend", "")
-        metrics = ((report.get("backends") or {}).get(backend) or {}).get("metrics", {})
+        report = outcome.report if isinstance(outcome.report, dict) else {}
+        backend = report.get("primary_backend") if isinstance(report.get("primary_backend"), str) else ""
+        backends = report.get("backends") if isinstance(report.get("backends"), dict) else {}
+        backend_report = backends.get(backend) if isinstance(backends.get(backend), dict) else {}
+        metrics = backend_report.get("metrics") if isinstance(backend_report.get("metrics"), dict) else {}
+        texture = report.get("texture") if isinstance(report.get("texture"), dict) else {}
+        refine = report.get("refine") if isinstance(report.get("refine"), dict) else {}
+        timings = report.get("timings") if isinstance(report.get("timings"), dict) else {}
 
         watertight = metrics.get("watertight")
         self.result_cards["triangles"].set_value(compact_number(metrics.get("triangles")), backend)
@@ -1008,12 +1136,12 @@ class MainWindow(QMainWindow):
 
         glb = outcome.directory / "mesh.glb"
         self.result_cards["glb"].set_value(size(glb.stat().st_size) if glb.is_file() else "—")
-        self.result_cards["texture"].set_value(percent((report.get("texture") or {}).get("coverage")))
-        self.result_cards["gaussians"].set_value(compact_number((report.get("refine") or {}).get("gaussians")))
+        self.result_cards["texture"].set_value(percent(texture.get("coverage")))
+        self.result_cards["gaussians"].set_value(compact_number(refine.get("gaussians")))
         self.result_cards["upload"].set_value(rate(outcome.upload_rate), size(outcome.payload_bytes))
         self.result_cards["download"].set_value(rate(outcome.download_rate), size(outcome.download_bytes))
 
-        self.result_timeline.set_timings(report.get("timings") or {})
+        self.result_timeline.set_timings(timings)
 
         preview = outcome.directory / "preview.png"
         if preview.is_file():
@@ -1022,14 +1150,18 @@ class MainWindow(QMainWindow):
             self.preview.clear_preview()
 
         self.artifacts_table.setRowCount(0)
-        for entry in outcome.artifacts:
+        artifacts = outcome.artifacts if isinstance(outcome.artifacts, list) else []
+        for entry in artifacts:
+            if not isinstance(entry, dict):
+                continue
             row = self.artifacts_table.rowCount()
             self.artifacts_table.insertRow(row)
-            self.artifacts_table.setItem(row, 0, QTableWidgetItem(entry.get("name", "")))
+            self.artifacts_table.setItem(row, 0, QTableWidgetItem(str(entry.get("name") or "")))
             self.artifacts_table.setItem(row, 1, QTableWidgetItem(size(entry.get("size"))))
 
-        for button in (self.open_folder_button, self.open_glb_button, self.view_3d_button):
-            button.setEnabled(True)
+        self.open_folder_button.setEnabled(outcome.directory.is_dir())
+        self.open_glb_button.setEnabled(glb.is_file())
+        self.view_3d_button.setEnabled(glb.is_file() and importlib.util.find_spec("open3d") is not None)
 
     def _current_directory(self) -> Path | None:
         if self.last_outcome is not None:
@@ -1039,7 +1171,10 @@ class MainWindow(QMainWindow):
     def _open_folder(self) -> None:
         directory = self._current_directory()
         if directory and directory.is_dir():
-            os.startfile(str(directory))  # noqa: S606 - ouverture de dossier voulue
+            try:
+                os.startfile(str(directory))  # noqa: S606 - ouverture de dossier voulue
+            except OSError as exc:
+                QMessageBox.warning(self, "miniDS", f"Ouverture impossible : {exc}")
 
     def _open_glb(self) -> None:
         directory = self._current_directory()
@@ -1047,9 +1182,21 @@ class MainWindow(QMainWindow):
             return
         glb = directory / "mesh.glb"
         if glb.is_file():
-            os.startfile(str(glb))  # noqa: S606
+            try:
+                os.startfile(str(glb))  # noqa: S606
+            except OSError as exc:
+                QMessageBox.warning(self, "miniDS", f"Ouverture impossible : {exc}")
         else:
             QMessageBox.information(self, "miniDS", "mesh.glb absent de ce scan.")
+
+    def _open_preview(self) -> None:
+        directory = self._current_directory()
+        preview = directory / "preview.png" if directory is not None else None
+        if preview is not None and preview.is_file():
+            try:
+                os.startfile(str(preview))  # noqa: S606
+            except OSError as exc:
+                QMessageBox.warning(self, "miniDS", f"Ouverture impossible : {exc}")
 
     def _open_3d_viewer(self) -> None:
         """Ouvre Open3D dans un processus séparé.
@@ -1064,6 +1211,9 @@ class MainWindow(QMainWindow):
         if not glb.is_file():
             QMessageBox.information(self, "miniDS", "mesh.glb absent de ce scan.")
             return
+        if importlib.util.find_spec("open3d") is None:
+            QMessageBox.warning(self, "miniDS", "Visionneuse indisponible : Open3D n'est pas installé.")
+            return
         script = (
             "import sys, open3d as o3d;"
             "m = o3d.io.read_triangle_mesh(sys.argv[1], enable_post_processing=True);"
@@ -1071,7 +1221,9 @@ class MainWindow(QMainWindow):
             "o3d.visualization.draw_geometries([m], window_name='miniDS', width=1100, height=800)"
         )
         try:
-            subprocess.Popen([sys.executable, "-c", script, str(glb)])
+            subprocess.Popen(  # noqa: S603 - interpréteur courant, script constant, chemin en argv
+                [sys.executable, "-c", script, str(glb)]
+            )
         except OSError as exc:
             QMessageBox.warning(self, "miniDS", f"Visionneuse indisponible : {exc}")
 
@@ -1124,7 +1276,10 @@ class MainWindow(QMainWindow):
             return
         directory = Path(self.history.records[rows[0].row()].directory)
         if directory.is_dir():
-            os.startfile(str(directory))  # noqa: S606
+            try:
+                os.startfile(str(directory))  # noqa: S606
+            except OSError as exc:
+                QMessageBox.warning(self, "miniDS", f"Ouverture impossible : {exc}")
         else:
             QMessageBox.information(self, "miniDS", "Ce dossier n'existe plus.")
 
@@ -1139,11 +1294,46 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:  # noqa: N802 - API Qt
         if self.scan_worker is not None and self.scan_worker.isRunning():
-            confirm = QMessageBox.question(self, "miniDS", "Un scan est en cours. Quitter et l'annuler ?")
-            if confirm != QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
-            self.scan_worker.cancel()
-            self.scan_worker.wait(5000)
+            # Fermer signifie se détacher, jamais annuler un GPU distant. Le
+            # bouton « Annuler » reste l'action explicite dédiée à cela.
+            self.scan_worker.detach()
+        if self._workers_running():
+            # Détruire un QThread actif peut faire terminer brutalement Python.
+            # On laisse les appels courts rendre la main et on referme via leur
+            # signal ``finished`` ; la fenêtre est gelée entre-temps.
+            self._close_requested = True
+            self.setEnabled(False)
+            self.statusBar().showMessage("Détachement du suivi puis fermeture… le job continue sur le pod")
+            event.ignore()
+            return
         self._save_settings()
         super().closeEvent(event)
+
+
+def _bounded_int(value: object, default: int, minimum: int, maximum: int) -> int:
+    try:
+        if isinstance(value, bool):
+            return default
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return max(minimum, min(maximum, parsed))
+
+
+def _bounded_float(value: object, default: float, minimum: float, maximum: float) -> float:
+    numeric = _optional_float(value)
+    if numeric is None:
+        return default
+    return max(minimum, min(maximum, numeric))
+
+
+def _optional_float(value: object) -> float | None:
+    try:
+        numeric = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def _choice(value: object, allowed: set[str], default: str) -> str:
+    return value if isinstance(value, str) and value in allowed else default

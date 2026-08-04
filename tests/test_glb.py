@@ -101,3 +101,49 @@ def test_encode_png_is_decodable():
     assert len(raw) == height * (1 + width * 3)
     assert raw[0] == 0  # octet de filtre
     assert np.frombuffer(raw[1 : 1 + width * 3], dtype=np.uint8).reshape(width, 3)[:, 0].tolist() == list(range(6))
+
+
+@pytest.mark.parametrize(
+    ("changes", "message"),
+    [
+        ({"vertices": np.empty((0, 3))}, "aucun sommet"),
+        ({"vertices": np.array([[0.0, np.nan, 0.0]])}, "non finie"),
+        ({"vertices": np.full((4, 3), 1e100)}, "float32"),
+        ({"normals": np.ones((2, 3))}, "4 lignes"),
+        ({"uvs": np.ones((4, 3)), "texture_png": b"\x89PNG\r\n\x1a\n"}, "UV"),
+        ({"uvs": np.ones((4, 2)), "texture_png": b"\x89PNG\r\n\x1a\n"}, "PNG valide"),
+        ({"vertex_colors": np.ones((4, 2))}, "couleurs"),
+        ({"vertex_colors": np.full((4, 3), 1.5)}, "intervalle"),
+    ],
+)
+def test_write_glb_rejects_invalid_attributes(tmp_path, changes, message):
+    vertices, faces = triangle_mesh()
+    kwargs = {"vertices": vertices, "faces": faces, **changes}
+    with pytest.raises(ValueError, match=message):
+        write_glb(tmp_path / "bad.glb", **kwargs)
+
+
+def test_glb_is_readable_by_open3d(tmp_path):
+    """Validation indépendante : notre propre parseur ne suffit pas à prouver l'interopérabilité."""
+    o3d = pytest.importorskip("open3d")
+    vertices, faces = triangle_mesh()
+    path = write_glb(tmp_path / "mesh.glb", vertices, faces, vertex_colors=np.ones((4, 3)))
+
+    mesh = o3d.io.read_triangle_mesh(str(path), enable_post_processing=True)
+
+    assert len(mesh.vertices) == len(vertices)
+    assert len(mesh.triangles) == len(faces)
+
+
+def test_textured_glb_is_readable_by_open3d(tmp_path):
+    o3d = pytest.importorskip("open3d")
+    vertices, faces = triangle_mesh()
+    uvs = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float32)
+    texture = encode_png(np.full((8, 8, 3), 128, dtype=np.uint8))
+    path = write_glb(tmp_path / "textured.glb", vertices, faces, uvs=uvs, texture_png=texture)
+
+    mesh = o3d.io.read_triangle_mesh(str(path), enable_post_processing=True)
+
+    assert len(mesh.vertices) == len(vertices)
+    assert len(mesh.triangles) == len(faces)
+    assert mesh.has_triangle_uvs()

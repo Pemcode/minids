@@ -77,8 +77,9 @@ Réponse attendue : `cuda_available: true`, le nom du GPU et la VRAM libre.
 | Coupure à ~100 s | requête longue | c'est la limite Cloudflare ; le client la contourne déjà, ne pas appeler l'API à la main avec `curl` sur de gros fichiers |
 | `CUDA out of memory` sur `vggt` | trop d'images | baisser `--frames` (100 tient sur 24 Go avec marge) |
 
-## 6. Coût indicatif
+## 6. Maîtriser le coût
 
-RTX 4090 à ~0,69 $/h · scan de 120 images ≈ 15–20 min → **≈ 0,20 $ par objet**.
-Penser à **arrêter le pod** entre deux scans : le volume `/workspace` conserve le
-cache des poids, le redémarrage suivant est rapide.
+Les tarifs RunPod varient selon la région, la disponibilité et le type de cloud.
+Vérifier le prix horaire affiché au moment de louer le GPU, puis commencer par le
+préréglage de validation. Penser à **arrêter le pod** entre deux scans : le volume
+`/workspace` conserve le cache des poids, le redémarrage suivant est rapide.

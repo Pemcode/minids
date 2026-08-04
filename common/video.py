@@ -21,6 +21,8 @@ import math
 import re
 import shutil
 import subprocess
+import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +31,7 @@ FRAME_GLOB = "frame_*.jpg"
 _METADATA_RE = re.compile(r"^frame:(\d+)\s")
 _BLUR_RE = re.compile(r"^lavfi\.blur=([0-9.eE+-]+)")
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
+EXTRACTION_TIMEOUT_SECONDS = 30 * 60
 
 
 class FFmpegError(RuntimeError):
@@ -62,33 +65,66 @@ def _tool(name: str) -> str:
 
 def probe(video: Path) -> VideoInfo:
     """Lit les métadonnées du flux vidéo via ffprobe."""
+    video = Path(video)
+    if not video.is_file():
+        raise FFmpegError(f"vidéo introuvable : {video}")
     command = [
-        _tool("ffprobe"), "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,r_frame_rate,codec_name,color_transfer,duration",
-        "-show_entries", "format=duration",
-        "-show_entries", "side_data=rotation",
-        "-of", "json", str(video),
+        _tool("ffprobe"),
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height,r_frame_rate,codec_name,color_transfer,duration",
+        "-show_entries",
+        "format=duration",
+        "-show_entries",
+        "side_data=rotation",
+        "-of",
+        "json",
+        str(video),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        # argv sans shell, exécutable résolu par shutil.which.
+        result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=30)  # noqa: S603
+    except subprocess.TimeoutExpired as exc:
+        raise FFmpegError(f"ffprobe ne répond pas sur {video.name}") from exc
     if result.returncode != 0:
         raise FFmpegError(f"ffprobe a échoué sur {video.name}: {result.stderr.strip()[:400]}")
-    payload = json.loads(result.stdout or "{}")
-    streams = payload.get("streams") or []
-    if not streams:
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise FFmpegError(f"réponse ffprobe invalide sur {video.name}") from exc
+    if not isinstance(payload, dict):
+        raise FFmpegError(f"réponse ffprobe invalide sur {video.name}")
+    streams = payload.get("streams")
+    if not isinstance(streams, list) or not streams:
         raise FFmpegError(f"aucun flux vidéo dans {video.name}")
     stream = streams[0]
+    if not isinstance(stream, dict):
+        raise FFmpegError(f"métadonnées du flux vidéo invalides dans {video.name}")
+    format_info = payload.get("format") if isinstance(payload.get("format"), dict) else {}
 
-    duration = _to_float(stream.get("duration")) or _to_float((payload.get("format") or {}).get("duration")) or 0.0
+    duration = _to_float(stream.get("duration")) or _to_float(format_info.get("duration")) or 0.0
     fps = _parse_rate(stream.get("r_frame_rate", "0/1"))
     rotation = 0
-    for side in stream.get("side_data_list", []) or []:
-        if "rotation" in side:
-            rotation = int(side["rotation"])
+    side_data = stream.get("side_data_list") if isinstance(stream.get("side_data_list"), list) else []
+    for side in side_data:
+        if isinstance(side, dict) and "rotation" in side:
+            try:
+                rotation = int(side["rotation"])
+            except (TypeError, ValueError):
+                rotation = 0
+
+    width = _to_int(stream.get("width"))
+    height = _to_int(stream.get("height"))
+    if width <= 0 or height <= 0:
+        raise FFmpegError(f"dimensions vidéo invalides dans {video.name}")
 
     return VideoInfo(
         path=video,
-        width=int(stream.get("width") or 0),
-        height=int(stream.get("height") or 0),
+        width=width,
+        height=height,
         duration=duration,
         fps=fps,
         codec=str(stream.get("codec_name") or "?"),
@@ -99,12 +135,21 @@ def probe(video: Path) -> VideoInfo:
 
 def _to_float(value: object) -> float:
     try:
-        return float(value)  # type: ignore[arg-type]
+        parsed = float(value)  # type: ignore[arg-type]
+        return parsed if math.isfinite(parsed) else 0.0
     except (TypeError, ValueError):
         return 0.0
 
 
-def _parse_rate(rate: str) -> float:
+def _to_int(value: object) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _parse_rate(rate: object) -> float:
+    rate = str(rate or "0/1")
     if "/" in rate:
         num, _, den = rate.partition("/")
         denominator = _to_float(den)
@@ -137,19 +182,63 @@ def _build_filters(info: VideoInfo, sample_fps: float, long_side: int, tonemap: 
     return ",".join(chain)
 
 
-def _run_extraction(video: Path, out_dir: Path, filters: str, quality: int) -> str:
+def _run_extraction(
+    video: Path,
+    out_dir: Path,
+    filters: str,
+    quality: int,
+    should_stop: Callable[[], bool] | None = None,
+) -> str:
     command = [
-        _tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y",
-        "-i", str(video),
-        "-vf", filters,
-        "-fps_mode", "passthrough",
-        "-q:v", str(quality),
+        _tool("ffmpeg"),
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-y",
+        "-i",
+        str(video),
+        "-vf",
+        filters,
+        "-fps_mode",
+        "passthrough",
+        "-q:v",
+        str(quality),
         str(out_dir / "cand_%05d.jpg"),
     ]
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        raise FFmpegError(f"ffmpeg a échoué: {result.stderr.strip()[:600]}")
-    return result.stdout
+    if should_stop is not None and should_stop():
+        raise FFmpegError("extraction interrompue")
+    process = subprocess.Popen(  # noqa: S603 - argv sans shell, ffmpeg résolu par shutil.which
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + EXTRACTION_TIMEOUT_SECONDS
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired as exc:
+            interrupted = should_stop is not None and should_stop()
+            timed_out = time.monotonic() >= deadline
+            if not interrupted and not timed_out:
+                continue
+            process.terminate()
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.communicate()
+            if interrupted:
+                raise FFmpegError("extraction interrompue") from exc
+            raise FFmpegError(
+                f"ffmpeg n'a pas terminé après {EXTRACTION_TIMEOUT_SECONDS // 60} min "
+                "(média corrompu ou anormalement long ?)"
+            ) from exc
+    if process.returncode != 0:
+        raise FFmpegError(f"ffmpeg a échoué: {stderr.strip()[:600]}")
+    return stdout
 
 
 def _parse_blur(stdout: str) -> dict[int, float]:
@@ -163,7 +252,9 @@ def _parse_blur(stdout: str) -> dict[int, float]:
             continue
         blur_match = _BLUR_RE.match(line.strip())
         if blur_match and current is not None:
-            blur[current] = float(blur_match.group(1))
+            value = float(blur_match.group(1))
+            if math.isfinite(value):
+                blur[current] = value
             current = None
     return blur
 
@@ -174,7 +265,9 @@ def select_sharpest(candidates: list[Path], blur: dict[int, float], count: int) 
     Conserve la couverture temporelle (donc angulaire) tout en éliminant les
     images bougées, ce qu'un simple tri global sur la netteté ne ferait pas.
     """
-    if count <= 0 or len(candidates) <= count:
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        raise ValueError("le nombre d'images doit être strictement positif")
+    if len(candidates) <= count:
         return list(candidates)
 
     total = len(candidates)
@@ -203,15 +296,25 @@ def extract_frames(
     oversample: int = 3,
     quality: int = 2,
     log: Callable[[str], None] = lambda _msg: None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[Path]:
     """Extrait `count` images nettes et uniformément réparties dans `out_dir`."""
     video = Path(video)
     out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    for stale in list(out_dir.glob("cand_*.jpg")) + list(out_dir.glob(FRAME_GLOB)):
-        stale.unlink()
+    if not video.is_file():
+        raise FFmpegError(f"vidéo introuvable : {video}")
+    if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+        raise ValueError("count doit être un entier strictement positif")
+    if not isinstance(long_side, int) or isinstance(long_side, bool) or long_side <= 0 or long_side % 2:
+        raise ValueError("long_side doit être un entier pair strictement positif")
+    if not isinstance(oversample, int) or isinstance(oversample, bool) or oversample <= 0:
+        raise ValueError("oversample doit être un entier strictement positif")
+    if not isinstance(quality, int) or isinstance(quality, bool) or not 1 <= quality <= 31:
+        raise ValueError("quality doit être un entier compris entre 1 et 31")
 
     info = probe(video)
+    if should_stop is not None and should_stop():
+        raise FFmpegError("extraction interrompue")
     log(
         f"vidéo {info.width}x{info.height} {info.fps:.1f} fps, {info.duration:.1f}s, "
         f"codec {info.codec}{', HDR' if info.is_hdr else ''}"
@@ -219,41 +322,70 @@ def extract_frames(
     if info.duration <= 0:
         raise FFmpegError("durée de la vidéo inconnue (fichier corrompu ?)")
 
-    candidates_wanted = max(count, min(count * oversample, int(info.duration * info.fps) or count * oversample))
+    # Ne demande jamais plus d'images que la source n'en contient : le filtre
+    # fps dupliquerait sinon une courte séquence jusqu'à atteindre count.
+    source_frames = max(1, math.ceil(info.duration * info.fps)) if info.fps > 0 else count
+    candidates_wanted = min(count * oversample, source_frames)
     sample_fps = max(0.1, candidates_wanted / info.duration)
 
-    tonemap = info.is_hdr
-    try:
-        stdout = _run_extraction(video, out_dir, _build_filters(info, sample_fps, long_side, tonemap), quality)
-    except FFmpegError as exc:
-        if not tonemap:
-            raise
-        # zimg absent ou chaîne refusée : on repasse en conversion simple.
-        log(f"tonemap HDR indisponible ({str(exc)[:120]}), extraction en conversion directe")
-        for stale in out_dir.glob("cand_*.jpg"):
-            stale.unlink()
-        stdout = _run_extraction(video, out_dir, _build_filters(info, sample_fps, long_side, False), quality)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # L'extraction se fait à part : une vidéo invalide ou un ffmpeg en erreur ne
+    # doit jamais effacer les images déjà présentes dans le dossier de sortie.
+    with tempfile.TemporaryDirectory(prefix=".minids-frames-", dir=out_dir) as staging_raw:
+        staging = Path(staging_raw)
+        tonemap = info.is_hdr
+        try:
+            stdout = _run_extraction(
+                video,
+                staging,
+                _build_filters(info, sample_fps, long_side, tonemap),
+                quality,
+                should_stop,
+            )
+        except FFmpegError as exc:
+            if not tonemap:
+                raise
+            # zimg absent ou chaîne refusée : on repasse en conversion simple.
+            log(f"tonemap HDR indisponible ({str(exc)[:120]}), extraction en conversion directe")
+            for stale in staging.glob("cand_*.jpg"):
+                stale.unlink()
+            stdout = _run_extraction(
+                video,
+                staging,
+                _build_filters(info, sample_fps, long_side, False),
+                quality,
+                should_stop,
+            )
 
-    candidates = sorted(out_dir.glob("cand_*.jpg"))
-    if not candidates:
-        raise FFmpegError("aucune image extraite (vidéo illisible ?)")
-    blur = _parse_blur(stdout)
-    log(f"{len(candidates)} candidates, mesure de flou sur {len(blur)}")
+        candidates = sorted(staging.glob("cand_*.jpg"))
+        if not candidates:
+            raise FFmpegError("aucune image extraite (vidéo illisible ?)")
+        blur = _parse_blur(stdout)
+        log(f"{len(candidates)} candidates, mesure de flou sur {len(blur)}")
 
-    selected = select_sharpest(candidates, blur, count)
-    kept = set(selected)
-    for candidate in candidates:
-        if candidate not in kept:
-            candidate.unlink()
+        selected = select_sharpest(candidates, blur, count)
+        staged_frames: list[Path] = []
+        for position, candidate in enumerate(selected):
+            target = staging / f"frame_{position:05d}.jpg"
+            candidate.replace(target)
+            staged_frames.append(target)
 
-    frames: list[Path] = []
-    for position, candidate in enumerate(selected):
-        target = out_dir / f"frame_{position:05d}.jpg"
-        candidate.replace(target)
-        frames.append(target)
-
-    if blur:
-        kept_blur = [blur.get(_candidate_index(p) - 1, 0.0) for p in selected]
+        measured = [blur[_candidate_index(path) - 1] for path in selected if _candidate_index(path) - 1 in blur]
         rejected = len(candidates) - len(selected)
-        log(f"{len(frames)} images gardées ({rejected} rejetées), flou moyen {sum(kept_blur) / len(kept_blur):.2f}")
-    return frames
+        if measured:
+            log(
+                f"{len(staged_frames)} images gardées ({rejected} rejetées), "
+                f"flou moyen {sum(measured) / len(measured):.2f}"
+            )
+        else:
+            log(f"{len(staged_frames)} images gardées ({rejected} rejetées), flou non mesuré")
+
+        for stale in list(out_dir.glob("cand_*.jpg")) + list(out_dir.glob(FRAME_GLOB)):
+            if stale.is_file() or stale.is_symlink():
+                stale.unlink()
+        frames: list[Path] = []
+        for staged in staged_frames:
+            target = out_dir / staged.name
+            staged.replace(target)
+            frames.append(target)
+        return frames

@@ -24,8 +24,14 @@ _STAGE_SECONDS = {"refine": 6.0, "vggt": 2.0, "mesh": 1.5}
 
 
 def _stage_duration(name: str) -> float:
-    scale = float(os.environ.get("MINIDS_FAKE_SPEED", "1.0"))
-    return _STAGE_SECONDS.get(name, 0.6) * max(0.0, scale)
+    raw_scale = os.environ.get("MINIDS_FAKE_SPEED", "1.0")
+    try:
+        scale = float(raw_scale)
+    except ValueError as exc:
+        raise ValueError(f"MINIDS_FAKE_SPEED invalide: {raw_scale!r}") from exc
+    if not np.isfinite(scale) or scale < 0:
+        raise ValueError(f"MINIDS_FAKE_SPEED doit être un nombre fini positif ou nul: {raw_scale!r}")
+    return _STAGE_SECONDS.get(name, 0.6) * scale
 
 
 def run_fake_pipeline(job: Job, reporter: Reporter, settings: Settings) -> None:
@@ -44,7 +50,7 @@ def run_fake_pipeline(job: Job, reporter: Reporter, settings: Settings) -> None:
             time.sleep(duration / steps)
             reporter.progress((step + 1) / steps)
 
-    frames = sorted(job.frames_dir.glob("*.jpg")) + sorted(job.frames_dir.glob("*.png"))
+    frames = sorted(path for path in job.frames_dir.glob("*") if path.suffix.lower() in {".jpg", ".jpeg", ".png"})
     reporter.log(f"[factice] {len(frames)} images vues, génération du cube de test")
 
     _write_fake_artifacts(job, frames_count=len(frames))
@@ -85,7 +91,11 @@ def _write_fake_artifacts(job: Job, frames_count: int) -> None:
         extrinsics=np.tile(np.eye(4, dtype=np.float32), (count, 1, 1)),
         intrinsics=np.tile(np.eye(3, dtype=np.float32), (count, 1, 1)),
         images=np.zeros((count, height, width, 3), dtype=np.uint8),
-        frame_names=np.array([f"frame_{i:05d}.jpg" for i in range(count)], dtype=object),
+        frame_names=np.asarray([f"frame_{i:05d}.jpg" for i in range(count)], dtype=np.str_),
+        scene_center=np.zeros(3, dtype=np.float32),
+        scene_scale=np.float32(1.0),
+        masks_packed=np.packbits(np.ones((count, height, width), dtype=bool)),
+        masks_shape=np.array([count, height, width], dtype=np.int64),
         fake=np.array([True]),
     )
 
@@ -116,6 +126,10 @@ def _unit_cube() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
 
 def _checkerboard(size: int, tiles: int = 8) -> np.ndarray:
+    if not isinstance(size, (int, np.integer)) or isinstance(size, (bool, np.bool_)) or size <= 0:
+        raise ValueError(f"taille de damier invalide: {size!r}")
+    if not isinstance(tiles, (int, np.integer)) or isinstance(tiles, (bool, np.bool_)) or tiles <= 0:
+        raise ValueError(f"nombre de cases invalide: {tiles!r}")
     step = max(1, size // tiles)
     ys, xs = np.mgrid[0:size, 0:size]
     pattern = ((xs // step + ys // step) % 2).astype(np.uint8)

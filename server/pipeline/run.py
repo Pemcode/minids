@@ -22,11 +22,11 @@ from ..jobs import Job, Reporter, unpack_input
 from . import cleanup as cleanup_module
 from . import mesh_poisson, mesh_tsdf, preview
 from . import texture as texture_module
-from .colmap_export import build_sparse_cloud, refine_with_bundle_adjustment, write_colmap
+from .colmap_export import build_sparse_cloud, write_colmap
 from .geometry import compute_normalization
 from .refine_2dgs import RefineConfig, RefineResult
 from .segment import segment
-from .vggt import VGGTResult, run_inference, world_points
+from .vggt import VGGTResult, _select_device, run_inference, world_points
 
 log = logging.getLogger("minids.run")
 
@@ -80,7 +80,9 @@ def run_pipeline(job: Job, reporter: Reporter, settings: Settings) -> None:
         log_fn=reporter.log,
     )
     dense_points = world_points(result)
-    normalization = compute_normalization(dense_points[np.isfinite(dense_points).all(axis=-1)])
+    valid_depth = np.isfinite(result.depth) & (result.depth > 0)
+    valid_points = valid_depth & np.isfinite(dense_points).all(axis=-1)
+    normalization = compute_normalization(dense_points[valid_points])
     reporter.log(f"échelle de scène normalisée (facteur {normalization.scale:.4f})")
     report["normalization"] = normalization.to_dict()
     reporter.progress(1.0)
@@ -120,9 +122,7 @@ def run_pipeline(job: Job, reporter: Reporter, settings: Settings) -> None:
     # -- 5. export COLMAP -------------------------------------------------
     reporter.stage("colmap")
     cloud = build_sparse_cloud(result, normalization, segmentation)
-    sparse_dir = write_colmap(job.work_dir, result, normalization, cloud, reporter.log)
-    if params.get("bundle_adjustment"):
-        refine_with_bundle_adjustment(sparse_dir, job.frames_dir, reporter.log)
+    write_colmap(job.work_dir, result, normalization, cloud, reporter.log)
     report["sparse_points"] = int(len(cloud.points))
     reporter.progress(1.0)
     reporter.check_cancelled()
@@ -144,7 +144,12 @@ def run_pipeline(job: Job, reporter: Reporter, settings: Settings) -> None:
     backends = params.get("mesh_backends") or ["tsdf2dgs"]
     if refined is None:
         backends = ["tsdf" if backend == "tsdf2dgs" else backend for backend in backends]
-        backends = list(dict.fromkeys(backends))
+    backends = list(dict.fromkeys(backends))
+    unknown = [backend for backend in backends if backend not in BACKEND_LABELS]
+    if unknown:
+        raise ValueError(f"backend de maillage inconnu: {unknown[0]}")
+    if not backends:
+        raise ValueError("aucun backend de maillage demandé")
 
     voxel_size = mesh_tsdf.voxel_size_from_bbox(
         segmentation.bbox_min if segmentation.bbox_min is not None else cloud.points.min(axis=0),
@@ -158,8 +163,15 @@ def run_pipeline(job: Job, reporter: Reporter, settings: Settings) -> None:
     for index, backend in enumerate(backends):
         reporter.log(f"maillage — {BACKEND_LABELS.get(backend, backend)}")
         meshes[backend] = _build_mesh(
-            backend, result, segmentation, refined, normalized_depth, normalized_extrinsics,
-            voxel_size, settings, reporter,
+            backend,
+            result,
+            segmentation,
+            refined,
+            normalized_depth,
+            normalized_extrinsics,
+            voxel_size,
+            settings,
+            reporter,
         )
         reporter.progress((index + 1) / len(backends))
         reporter.check_cancelled()
@@ -171,20 +183,24 @@ def run_pipeline(job: Job, reporter: Reporter, settings: Settings) -> None:
     )
     for index, (backend, mesh) in enumerate(list(meshes.items())):
         meshes[backend] = cleanup_module.clean(
-            mesh, cleanup_config, segmentation.bbox_min, segmentation.bbox_max,
-            segmentation.plane, voxel_size, reporter.log,
+            mesh,
+            cleanup_config,
+            segmentation.bbox_min,
+            segmentation.bbox_max,
+            segmentation.plane,
+            voxel_size,
+            reporter.log,
         )
+        if not len(meshes[backend].triangles):
+            raise ValueError(f"maillage vide pour le backend {backend} après nettoyage")
         report["backends"].setdefault(backend, {})["metrics"] = cleanup_module.mesh_metrics(meshes[backend])
         reporter.progress((index + 1) / len(meshes))
         reporter.check_cancelled()
 
     primary_backend = backends[0]
     primary_mesh = meshes[primary_backend]
-    if not len(primary_mesh.triangles):
-        raise ValueError(f"maillage vide pour le backend {primary_backend} : scan inexploitable")
-
     reporter.stage("texture")
-    bake = _bake_texture(primary_mesh, result, segmentation, refined, normalized_extrinsics, params, reporter)
+    bake = _bake_texture(primary_mesh, result, segmentation, normalized_extrinsics, params, reporter)
     report["texture"] = {"method": bake.method, "coverage": round(bake.coverage, 4)}
     reporter.progress(1.0)
 
@@ -192,6 +208,8 @@ def run_pipeline(job: Job, reporter: Reporter, settings: Settings) -> None:
     reporter.stage("export")
     scale_to_real = _real_scale(primary_mesh, params.get("ref_size"))
     report["export_scale"] = scale_to_real
+    for backend_report in report["backends"].values():
+        backend_report["metrics"] = cleanup_module.scale_metrics_for_export(backend_report["metrics"], scale_to_real)
     _write_glb(job.artifacts_dir / "mesh.glb", bake, scale_to_real)
     for backend, mesh in meshes.items():
         if backend != primary_backend:
@@ -211,8 +229,12 @@ def run_pipeline(job: Job, reporter: Reporter, settings: Settings) -> None:
 # Étapes
 # ---------------------------------------------------------------------------
 
+
 def _prepare_frames(kind: str, target: Path, frames_dir: Path, count: int, reporter: Reporter) -> list[Path]:
     from common.video import extract_frames
+
+    if not isinstance(count, (int, np.integer)) or isinstance(count, (bool, np.bool_)) or count <= 0:
+        raise ValueError(f"nombre de frames invalide: {count!r}")
 
     if kind == "video":
         return extract_frames(target, frames_dir, count=count, log=reporter.log)
@@ -241,9 +263,18 @@ def _run_refinement(
 
     config = RefineConfig(iterations=int(params.get("gs_iters", 12_000)))
     # La profondeur n'ancre l'optimisation que là où le modèle est confiant.
-    confidence = result.depth_conf
-    threshold = float(np.percentile(confidence, 40.0))
-    weights = np.clip((confidence - threshold) / max(1e-6, confidence.max() - threshold), 0.0, 1.0)
+    confidence = np.asarray(result.depth_conf, dtype=np.float32)
+    finite_confidence = confidence[np.isfinite(confidence)]
+    if not finite_confidence.size:
+        raise ValueError("aucune confiance VGGT-Ω finie pour le raffinement")
+    threshold = float(np.percentile(finite_confidence, 40.0))
+    maximum = float(finite_confidence.max())
+    weights = np.zeros_like(confidence, dtype=np.float32)
+    finite = np.isfinite(confidence)
+    if maximum > threshold:
+        weights[finite] = np.clip((confidence[finite] - threshold) / (maximum - threshold), 0.0, 1.0)
+    else:
+        weights[finite] = 1.0
 
     return refine(
         images=result.images,
@@ -255,7 +286,7 @@ def _run_refinement(
         init_points=cloud.points,
         init_colors=cloud.colors.astype(np.float32) / 255.0,
         config=config,
-        device=settings.device,
+        device=_select_device(settings.device),
         log_fn=reporter.log,
         progress_fn=reporter.progress,
         should_stop=reporter.check_cancelled,
@@ -273,25 +304,34 @@ def _build_mesh(
     settings: Settings,
     reporter: Reporter,
 ) -> Any:
-    device = "CUDA:0" if settings.device.startswith("cuda") else "CPU:0"
+    device = "CUDA:0" if settings.device.lower().startswith("cuda") else "CPU:0"
     tsdf_config = mesh_tsdf.TSDFConfig(voxel_size=voxel_size)
 
     if backend == "tsdf2dgs":
         if refined is None:
             raise ValueError("backend tsdf2dgs demandé sans raffinement")
         return mesh_tsdf.fuse(
-            depths=refined.depths, colors=refined.colors,
-            intrinsics=result.intrinsics, extrinsics=normalized_extrinsics,
-            config=tsdf_config, masks=segmentation.masks, alphas=refined.alphas,
-            device=device, log_fn=reporter.log,
+            depths=refined.depths,
+            colors=refined.colors,
+            intrinsics=result.intrinsics,
+            extrinsics=normalized_extrinsics,
+            config=tsdf_config,
+            masks=segmentation.masks,
+            alphas=refined.alphas,
+            device=device,
+            log_fn=reporter.log,
         )
 
     if backend == "tsdf":
         return mesh_tsdf.fuse(
-            depths=normalized_depth, colors=result.images,
-            intrinsics=result.intrinsics, extrinsics=normalized_extrinsics,
-            config=tsdf_config, masks=segmentation.masks,
-            device=device, log_fn=reporter.log,
+            depths=normalized_depth,
+            colors=result.images,
+            intrinsics=result.intrinsics,
+            extrinsics=normalized_extrinsics,
+            config=tsdf_config,
+            masks=segmentation.masks,
+            device=device,
+            log_fn=reporter.log,
         )
 
     if backend == "poisson":
@@ -299,12 +339,19 @@ def _build_mesh(
         colors = refined.colors if refined is not None else result.images
         alphas = refined.alphas if refined is not None else None
         points, point_colors = mesh_poisson.point_cloud_from_depths(
-            depths, colors, result.intrinsics, normalized_extrinsics,
-            masks=segmentation.masks, alphas=alphas,
+            depths,
+            colors,
+            result.intrinsics,
+            normalized_extrinsics,
+            masks=segmentation.masks,
+            alphas=alphas,
         )
         return mesh_poisson.reconstruct(
-            points, point_colors, normalized_extrinsics,
-            mesh_poisson.PoissonConfig(voxel_size=voxel_size), reporter.log,
+            points,
+            point_colors,
+            normalized_extrinsics,
+            mesh_poisson.PoissonConfig(voxel_size=voxel_size),
+            reporter.log,
         )
 
     raise ValueError(f"backend de maillage inconnu: {backend}")
@@ -314,7 +361,6 @@ def _bake_texture(
     mesh: Any,
     result: VGGTResult,
     segmentation: Any,
-    refined: RefineResult | None,
     normalized_extrinsics: np.ndarray,
     params: dict[str, Any],
     reporter: Reporter,
@@ -347,13 +393,17 @@ def _bake_texture(
 
 def _real_scale(mesh: Any, ref_size: float | None) -> float:
     """Facteur ramenant le maillage à sa taille réelle si l'utilisateur l'a donnée."""
-    if not ref_size:
+    if ref_size is None:
         return 1.0
+    if not np.isfinite(ref_size) or ref_size <= 0:
+        raise ValueError(f"taille de référence invalide: {ref_size!r}")
     vertices = np.asarray(mesh.vertices)
     if not len(vertices):
-        return 1.0
+        raise ValueError("maillage vide, mise à l'échelle impossible")
     extent = float((vertices.max(axis=0) - vertices.min(axis=0)).max())
-    return float(ref_size) / extent if extent > 1e-9 else 1.0
+    if extent <= 1e-9:
+        raise ValueError("maillage d'étendue nulle, mise à l'échelle impossible")
+    return float(ref_size) / extent
 
 
 def _write_glb(path: Path, bake: texture_module.BakeResult, scale: float) -> None:
@@ -386,9 +436,7 @@ def _write_backend_glb(path: Path, mesh: Any, scale: float) -> None:
     )
 
 
-def _write_preview(
-    path: Path, mesh: Any, result: VGGTResult, extrinsics: np.ndarray, reporter: Reporter
-) -> None:
+def _write_preview(path: Path, mesh: Any, result: VGGTResult, extrinsics: np.ndarray, reporter: Reporter) -> None:
     from common.glb import encode_png
 
     try:

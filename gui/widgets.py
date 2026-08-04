@@ -8,10 +8,11 @@ dit immédiatement quel paramètre ajuster.
 
 from __future__ import annotations
 
+import math
 import time
 
 from PyQt6.QtCore import QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QFont, QPainter, QPixmap
+from PyQt6.QtGui import QColor, QCursor, QFont, QPainter, QPainterPath, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -28,12 +29,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from server.jobs import STAGES
-
 from . import theme
 from .formatting import duration, percent
 
-STAGE_ORDER = [name for name, _weight in STAGES]
+STAGE_ORDER = list(theme.STAGE_COLORS)
 
 
 class MetricCard(QFrame):
@@ -65,11 +64,14 @@ class MetricCard(QFrame):
         layout.addWidget(self._title)
         layout.addWidget(self._value)
         layout.addWidget(self._hint)
+        self.setAccessibleName(title)
+        self.setAccessibleDescription(f"{title} : {value}")
 
     def set_value(self, value: str, hint: str = "", color: str | None = None) -> None:
         self._value.setText(value)
         self._value.setStyleSheet(f"border:none; color:{color or theme.TEXT};")
         self._hint.setText(hint)
+        self.setAccessibleDescription(f"{self._title.text()} : {value}{f', {hint}' if hint else ''}")
 
 
 class StageTimeline(QWidget):
@@ -82,9 +84,17 @@ class StageTimeline(QWidget):
         self.setMinimumHeight(74)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMouseTracking(True)
+        self.setAccessibleName("Répartition du temps par étape")
 
     def set_timings(self, timings: dict[str, float], current: str = "") -> None:
-        self._timings = {k: float(v) for k, v in (timings or {}).items() if v is not None}
+        self._timings = {}
+        for key, value in (timings or {}).items():
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(key, str) and math.isfinite(numeric) and numeric >= 0:
+                self._timings[key] = numeric
         self._current = current
         self._refresh_tooltip()
         self.update()
@@ -103,6 +113,10 @@ class StageTimeline(QWidget):
             if value > 0
         ]
         self.setToolTip("\n".join(lines))
+        self.setAccessibleDescription("; ".join(lines))
+
+    def _ordered_stages(self) -> list[str]:
+        return STAGE_ORDER + [name for name in self._timings if name not in STAGE_ORDER]
 
     def paintEvent(self, event) -> None:  # noqa: N802 - API Qt
         painter = QPainter(self)
@@ -117,8 +131,12 @@ class StageTimeline(QWidget):
         painter.drawRoundedRect(QRectF(0, 0, width, bar_height), 6, 6)
 
         if total > 0:
+            clip = QPainterPath()
+            clip.addRoundedRect(QRectF(0, 0, width, bar_height), 6, 6)
+            painter.save()
+            painter.setClipPath(clip)
             offset = 0.0
-            for name in STAGE_ORDER:
+            for name in self._ordered_stages():
                 value = self._timings.get(name, 0.0)
                 if value <= 0:
                     continue
@@ -129,6 +147,7 @@ class StageTimeline(QWidget):
                 painter.setBrush(color)
                 painter.drawRect(QRectF(offset, 0, max(1.0, segment), bar_height))
                 offset += segment
+            painter.restore()
             # Réapplique les coins arrondis sur les extrémités.
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QColor(theme.BORDER))
@@ -142,7 +161,7 @@ class StageTimeline(QWidget):
         # Légende : uniquement les étapes réellement chronométrées.
         painter.setFont(QFont("Segoe UI", 8))
         x, y = 0.0, bar_height + 10.0
-        for name in STAGE_ORDER:
+        for name in self._ordered_stages():
             value = self._timings.get(name, 0.0)
             if value <= 0:
                 continue
@@ -170,6 +189,7 @@ class LogView(QPlainTextEdit):
         self.setReadOnly(True)
         self.setMaximumBlockCount(2000)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setAccessibleName("Journal du scan")
 
     def append_line(self, text: str) -> None:
         # Ne force le défilement que si l'utilisateur était déjà en bas : sinon
@@ -191,6 +211,10 @@ class PreviewPane(QLabel):
         self._pixmap: QPixmap | None = None
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumHeight(180)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.setAccessibleName("Aperçu du résultat")
+        self.setToolTip("Cliquer ou appuyer sur Entrée pour ouvrir l'aperçu")
         self.setStyleSheet(
             f"background:{theme.SURFACE_HIGH}; border:1px solid {theme.BORDER};"
             f"border-radius:8px; color:{theme.TEXT_DIM};"
@@ -204,6 +228,8 @@ class PreviewPane(QLabel):
             self.setText("aperçu illisible")
             return False
         self._pixmap = pixmap
+        self.setText("")
+        self.setAccessibleDescription(f"Aperçu chargé depuis {path}")
         self._rescale()
         return True
 
@@ -211,6 +237,7 @@ class PreviewPane(QLabel):
         self._pixmap = None
         self.setPixmap(QPixmap())
         self.setText("aucun aperçu")
+        self.setAccessibleDescription("Aucun aperçu disponible")
 
     def _rescale(self) -> None:
         if self._pixmap is None:
@@ -228,8 +255,16 @@ class PreviewPane(QLabel):
         self._rescale()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - API Qt
-        self.clicked.emit()
+        if self._pixmap is not None and event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
         super().mousePressEvent(event)
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - API Qt
+        if self._pixmap is not None and event.key() in {Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Space}:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class JobPickerDialog(QDialog):
@@ -258,6 +293,7 @@ class JobPickerDialog(QDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setAccessibleName("Jobs disponibles sur le pod")
         self.table.doubleClicked.connect(self.accept)
 
         for row, job in enumerate(jobs):
@@ -267,7 +303,7 @@ class JobPickerDialog(QDialog):
                 job.get("status", ""),
                 job.get("stage") or "—",
                 percent(job.get("progress")),
-                time.strftime("%d/%m %H:%M", time.localtime(created)) if created else "—",
+                _format_timestamp(created),
             ]
             for column, value in enumerate(values):
                 self.table.setItem(row, column, QTableWidgetItem(str(value)))
@@ -276,19 +312,18 @@ class JobPickerDialog(QDialog):
         layout.addWidget(self.table, 1)
 
         hint = QLabel(
-            "Un job « running » se rejoint en direct ; un job « done » se contente de "
-            "retélécharger ses artefacts."
+            "Un job « starting » ou « running » se rejoint en direct ; un job « done » se contente de "
+            "retélécharger ses artefacts. Un job « created » a un upload incomplet et ne peut pas être repris ici."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color:{theme.TEXT_DIM};")
         layout.addWidget(hint)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         # Qt libelle ses boutons standards en anglais tant qu'aucune traduction
         # n'est chargée : on les nomme donc explicitement.
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Rejoindre")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(bool(jobs))
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Annuler")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -317,9 +352,22 @@ class StatusDot(QWidget):
         layout.addWidget(self._dot)
         layout.addWidget(self._label)
         layout.addStretch(1)
+        self.setAccessibleName("État de la connexion")
+        self.setAccessibleDescription("non connecté")
 
     def set_state(self, text: str, color: str) -> None:
         self._color = color
         self._dot.setStyleSheet(f"color:{color}; font-size:14px;")
         self._label.setText(text)
         self._label.setStyleSheet(f"color:{theme.TEXT};")
+        self.setAccessibleDescription(text)
+
+
+def _format_timestamp(value: object) -> str:
+    try:
+        timestamp = float(value)  # type: ignore[arg-type]
+        if not math.isfinite(timestamp):
+            return "—"
+        return time.strftime("%d/%m %H:%M", time.localtime(timestamp))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "—"

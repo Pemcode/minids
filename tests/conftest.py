@@ -26,12 +26,13 @@ def _noise_png(seed: int, size: int = 128) -> bytes:
 
     def chunk(tag: bytes, payload: bytes) -> bytes:
         return (
-            struct.pack(">I", len(payload)) + tag + payload
-            + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+            struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
         )
 
     header = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
-    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+    return (
+        b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b"")
+    )
 
 
 @pytest.fixture

@@ -31,9 +31,7 @@ def install_french(app: QApplication) -> QTranslator | None:
 
 
 def main() -> int:
-    QApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
+    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
     app.setApplicationName("miniDS")
     app.setStyle("Fusion")  # base neutre : la feuille de style s'applique de façon homogène

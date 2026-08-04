@@ -5,6 +5,7 @@
 # du pod : lisibles depuis l'interface RunPod, donc toujours pas besoin d'ouvrir
 # un terminal web.
 set -euo pipefail
+umask 077
 
 DATA_DIR="${MINIDS_DATA_DIR:-/workspace/minids}"
 PORT="${MINIDS_PORT:-8000}"
@@ -12,12 +13,15 @@ mkdir -p "$DATA_DIR/cache" "$DATA_DIR/jobs"
 
 if [ -z "${MINIDS_TOKEN:-}" ]; then
     TOKEN_FILE="$DATA_DIR/token.txt"
-    if [ -f "$TOKEN_FILE" ]; then
-        MINIDS_TOKEN="$(cat "$TOKEN_FILE")"
-    else
+    MINIDS_TOKEN=""
+    if [ -s "$TOKEN_FILE" ]; then
+        MINIDS_TOKEN="$(<"$TOKEN_FILE")"
+    fi
+    if [ -z "$MINIDS_TOKEN" ]; then
         MINIDS_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(24))')"
         printf '%s' "$MINIDS_TOKEN" > "$TOKEN_FILE"
     fi
+    chmod 600 "$TOKEN_FILE"
     export MINIDS_TOKEN
     echo "=============================================================="
     echo " MINIDS_TOKEN généré : $MINIDS_TOKEN"

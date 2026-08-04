@@ -26,11 +26,6 @@ WORKDIR /opt
 COPY docker/requirements.txt /opt/requirements.txt
 RUN pip install --upgrade pip && pip install -r /opt/requirements.txt
 
-# Optionnel : sans wheel disponible, on continue sans ajustement de faisceaux
-# plutôt que de perdre tout le build (le pipeline gère déjà son absence).
-RUN pip install pycolmap==3.11.1 \
-    || echo "AVERTISSEMENT: pycolmap indisponible — option --bundle-adjustment inactive"
-
 # Précompile les noyaux CUDA de gsplat pendant le build. Sans cela, ils se
 # compilent au premier scan sur le pod : plusieurs minutes de GPU facturées, à
 # chaque démarrage de pod.
@@ -39,7 +34,7 @@ RUN python -c "import gsplat.cuda._backend as b; print('noyaux gsplat compilés'
 
 # VGGT-Ω : dépôt source, les poids sont téléchargés au démarrage (accès HF restreint).
 ARG VGGT_OMEGA_REF=main
-RUN git clone --depth 1 --branch ${VGGT_OMEGA_REF} https://github.com/facebookresearch/vggt-omega.git /opt/vggt-omega \
+RUN git clone --depth 1 --branch "${VGGT_OMEGA_REF}" https://github.com/facebookresearch/vggt-omega.git /opt/vggt-omega \
     && pip install -e /opt/vggt-omega
 
 WORKDIR /app

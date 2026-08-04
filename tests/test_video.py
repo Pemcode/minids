@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from common.video import _parse_blur, extract_frames, probe, select_sharpest
+from common.video import FFmpegError, VideoInfo, _parse_blur, extract_frames, probe, select_sharpest
 
 pytestmark = pytest.mark.filterwarnings("ignore")
 HAS_FFMPEG = shutil.which("ffmpeg") is not None and shutil.which("ffprobe") is not None
@@ -58,6 +58,99 @@ def test_select_sharpest_preserves_temporal_order():
 def test_select_sharpest_returns_all_when_not_enough():
     candidates = [Path("cand_00001.jpg"), Path("cand_00002.jpg")]
     assert select_sharpest(candidates, {}, count=10) == candidates
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"count": 0}, "count"),
+        ({"long_side": 161}, "long_side"),
+        ({"oversample": 0}, "oversample"),
+        ({"quality": 0}, "quality"),
+    ],
+)
+def test_extract_frames_validates_options_before_touching_output(tmp_path, kwargs, message):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"placeholder")
+    output = tmp_path / "frames"
+    output.mkdir()
+    existing = output / "frame_00000.jpg"
+    existing.write_bytes(b"keep me")
+
+    with pytest.raises(ValueError, match=message):
+        extract_frames(video, output, **kwargs)
+
+    assert existing.read_bytes() == b"keep me"
+
+
+def test_failed_staged_extraction_preserves_existing_frames(tmp_path, monkeypatch):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"placeholder")
+    output = tmp_path / "frames"
+    output.mkdir()
+    existing = output / "frame_00000.jpg"
+    existing.write_bytes(b"keep me")
+    info = VideoInfo(video, 320, 240, 4.0, 10.0, "h264", "", 0)
+    monkeypatch.setattr("common.video.probe", lambda _path: info)
+    monkeypatch.setattr(
+        "common.video._run_extraction",
+        lambda *args, **kwargs: (_ for _ in ()).throw(FFmpegError("boom")),
+    )
+
+    with pytest.raises(FFmpegError, match="boom"):
+        extract_frames(video, output, count=20, long_side=160)
+
+    assert existing.read_bytes() == b"keep me"
+
+
+def test_short_video_is_not_duplicated_to_reach_requested_count(tmp_path, monkeypatch):
+    from common import video as video_module
+
+    source = tmp_path / "short.mp4"
+    source.write_bytes(b"video")
+    monkeypatch.setattr(
+        video_module,
+        "probe",
+        lambda _path: VideoInfo(source, 320, 240, 1.0, 10.0, "h264", "", 0),
+    )
+    observed_filters = []
+
+    def fake_extract(_video, staging, filters, _quality, _should_stop=None):
+        observed_filters.append(filters)
+        for index in range(1, 11):
+            (staging / f"cand_{index:05d}.jpg").write_bytes(b"jpg")
+        return ""
+
+    monkeypatch.setattr(video_module, "_run_extraction", fake_extract)
+
+    frames = video_module.extract_frames(source, tmp_path / "frames", count=120)
+
+    assert len(frames) == 10
+    assert observed_filters[0].startswith("fps=10.000000")
+
+
+def test_extract_frames_stops_before_launching_ffmpeg(tmp_path, monkeypatch):
+    from common import video as video_module
+
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"video")
+    monkeypatch.setattr(
+        video_module,
+        "probe",
+        lambda _path: VideoInfo(source, 320, 240, 1.0, 10.0, "h264", "", 0),
+    )
+    monkeypatch.setattr(
+        video_module.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("ffmpeg ne doit pas être lancé"),
+    )
+
+    with pytest.raises(FFmpegError, match="interrompue"):
+        video_module.extract_frames(
+            source,
+            tmp_path / "frames",
+            should_stop=lambda: True,
+        )
 
 
 def _make_video(path: Path, blurred_second_half: bool) -> None:

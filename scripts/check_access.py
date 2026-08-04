@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 
 API = "https://huggingface.co/api"
@@ -38,13 +39,21 @@ def request(path: str, token: str | None) -> tuple[int, dict | None]:
     headers = {"User-Agent": "minids-check"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(f"{API}{path}", headers=headers)
+    req = urllib.request.Request(f"{API}{path}", headers=headers)  # noqa: S310 - API HTTPS constante
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return response.status, json.loads(response.read())
+        with urllib.request.urlopen(req, timeout=30) as response:  # noqa: S310 - requête HTTPS construite ci-dessus
+            try:
+                payload = json.loads(response.read())
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                print(f"réponse JSON invalide : {exc}", file=sys.stderr)
+                return response.status, None
+            if not isinstance(payload, dict):
+                print("réponse JSON inattendue", file=sys.stderr)
+                return response.status, None
+            return response.status, payload
     except urllib.error.HTTPError as exc:
         return exc.code, None
-    except urllib.error.URLError as exc:
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
         print(f"réseau indisponible : {exc}", file=sys.stderr)
         return 0, None
 
@@ -55,17 +64,27 @@ def check_identity(token: str) -> bool:
         print(f"✗ token refusé par Hugging Face (HTTP {status})")
         print("  → https://huggingface.co/settings/tokens — créer un token de type 'Read'")
         return False
-    scopes = (payload.get("auth") or {}).get("accessToken", {}).get("role", "?")
+    auth = payload.get("auth") if isinstance(payload.get("auth"), dict) else {}
+    access = auth.get("accessToken") if isinstance(auth.get("accessToken"), dict) else {}
+    scopes = access.get("role", "?")
     print(f"✓ token valide — utilisateur « {payload.get('name')} », rôle « {scopes} »")
     return True
 
 
 def check_repo(repo: str, token: str) -> list[str] | None:
     """Retourne la liste des fichiers de poids, ou None si l'accès est refusé."""
-    status, payload = request(f"/models/{repo}", token)
+    repo = repo.strip()
+    if not repo:
+        print("? dépôt vide ignoré")
+        return None
+    encoded_repo = urllib.parse.quote(repo, safe="/")
+    status, payload = request(f"/models/{encoded_repo}", token)
     if status == 200 and payload is not None:
-        files = [s["rfilename"] for s in payload.get("siblings", [])]
-        weights = [f for f in files if f.endswith(WEIGHT_SUFFIXES)]
+        siblings = payload.get("siblings") if isinstance(payload.get("siblings"), list) else []
+        files = [
+            item["rfilename"] for item in siblings if isinstance(item, dict) and isinstance(item.get("rfilename"), str)
+        ]
+        weights = sorted(file for file in files if file.lower().endswith(WEIGHT_SUFFIXES))
         gated = payload.get("gated")
         print(f"✓ {repo} — accès OK{' (dépôt restreint, approuvé)' if gated else ''}")
         for name in weights:
@@ -88,6 +107,7 @@ def main() -> int:
     parser.add_argument("--repo", action="append", default=[], help="dépôt supplémentaire à tester")
     args = parser.parse_args()
 
+    args.token = args.token.strip()
     if not args.token:
         print("HF_TOKEN absent. Le définir, ou passer --token hf_xxx", file=sys.stderr)
         return 2
@@ -96,7 +116,8 @@ def main() -> int:
 
     print("\n— VGGT-Ω —")
     resolved: tuple[str, list[str]] | None = None
-    for repo in VGGT_CANDIDATES + args.repo:
+    repositories = list(dict.fromkeys(VGGT_CANDIDATES + [repo.strip() for repo in args.repo if repo.strip()]))
+    for repo in repositories:
         weights = check_repo(repo, args.token)
         if weights is not None and resolved is None:
             resolved = (repo, weights)
@@ -120,7 +141,7 @@ def main() -> int:
     value = f"{repo}:{chosen}" if chosen else repo
     print("À reporter dans les variables d'environnement du template RunPod :")
     print(f"    MINIDS_CKPT = {value}")
-    print(f"    HF_TOKEN    = {args.token[:7]}…{args.token[-4:]}")
+    print(f"    HF_TOKEN    = {_mask_token(args.token)}")
     if chosen and PREFERRED_RESOLUTION not in chosen:
         print()
         print(f"  ⚠ aucun poids en {PREFERRED_RESOLUTION} px trouvé : ajouter")
@@ -133,8 +154,16 @@ def pick_checkpoint(weights: list[str]) -> str | None:
     """Choisit la variante 512 quand elle existe, sinon le premier poids."""
     if not weights:
         return None
-    preferred = [name for name in weights if PREFERRED_RESOLUTION in name]
-    return preferred[0] if preferred else weights[0]
+    ordered = sorted(str(name) for name in weights)
+    preferred = [name for name in ordered if PREFERRED_RESOLUTION in name]
+    return preferred[0] if preferred else ordered[0]
+
+
+def _mask_token(token: str) -> str:
+    """Affiche juste assez du jeton pour l'identifier, jamais sa valeur complète."""
+    if len(token) <= 7:
+        return f"{token[:2]}…"
+    return f"{token[:3]}…{token[-4:]}"
 
 
 if __name__ == "__main__":

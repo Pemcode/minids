@@ -94,6 +94,7 @@ def pump(application, predicate, timeout: float = 120.0) -> bool:
 # Formatage
 # ---------------------------------------------------------------------------
 
+
 def test_formatting_handles_missing_values():
     assert duration(None) == "—"
     assert size(None) == "—"
@@ -101,6 +102,8 @@ def test_formatting_handles_missing_values():
     assert percent(None) == "—"
     assert boolean(None) == "—"
     assert compact_number(None) == "—"
+    assert duration(float("nan")) == "—"
+    assert percent(float("inf")) == "—"
 
 
 def test_formatting_values():
@@ -116,6 +119,7 @@ def test_formatting_values():
 # Persistance
 # ---------------------------------------------------------------------------
 
+
 def test_settings_never_persist_token_unless_asked(isolated_store):
     settings = Settings(url="http://pod", token="secret", remember_token=False)
     settings.save()
@@ -130,26 +134,59 @@ def test_settings_persist_token_when_asked(isolated_store):
     assert Settings.load().token == "secret"
 
 
+def test_settings_recover_from_valid_json_with_the_wrong_shape(isolated_store):
+    store.SETTINGS_PATH.write_text("[]", encoding="utf-8")
+    assert Settings.load() == Settings()
+
+    store.SETTINGS_PATH.write_text('{"long_side":"huge","params":[],"remember_token":"yes"}', encoding="utf-8")
+    loaded = Settings.load()
+    assert loaded.long_side == 1024
+    assert loaded.params == {}
+    assert loaded.remember_token is False
+
+
 def test_history_summary_and_averages(isolated_store):
     history = History()
-    history.add(ScanRecord(
-        job_id="a", timestamp=time.time(), source="v1.mp4", status="done",
-        timings={"vggt": 10.0, "refine": 90.0}, metrics={"triangles": 100_000},
-        client={"total_seconds": 120.0, "upload_rate": 1_000_000.0},
-    ))
-    history.add(ScanRecord(
-        job_id="b", timestamp=time.time(), source="v2.mp4", status="done",
-        timings={"vggt": 20.0, "refine": 110.0}, metrics={"triangles": 200_000},
-        client={"total_seconds": 180.0, "upload_rate": 3_000_000.0},
-    ))
-    history.add(ScanRecord(
-        job_id="c", timestamp=time.time(), source="v3.mp4", status="failed", error="boum",
-    ))
+    history.add(
+        ScanRecord(
+            job_id="a",
+            timestamp=time.time(),
+            source="v1.mp4",
+            status="done",
+            timings={"vggt": 10.0, "refine": 90.0},
+            metrics={"triangles": 100_000},
+            client={"total_seconds": 120.0, "upload_rate": 1_000_000.0},
+        )
+    )
+    history.add(
+        ScanRecord(
+            job_id="b",
+            timestamp=time.time(),
+            source="v2.mp4",
+            status="done",
+            timings={"vggt": 20.0, "refine": 110.0},
+            metrics={"triangles": 200_000},
+            client={"total_seconds": 180.0, "upload_rate": 3_000_000.0},
+        )
+    )
+    history.add(
+        ScanRecord(
+            job_id="c",
+            timestamp=time.time(),
+            source="v3.mp4",
+            status="failed",
+            error="boum",
+        )
+    )
 
     summary = history.summary()
     assert summary == {
-        "count": 3, "done": 2, "failed": 1,
-        "median_duration": 150.0, "median_triangles": 150_000.0, "median_upload_rate": 2_000_000.0,
+        "count": 3,
+        "done": 2,
+        "failed": 1,
+        "median_duration": 150.0,
+        "median_triangles": 150_000.0,
+        "median_upload_rate": 2_000_000.0,
     }
     assert history.average_timings() == {"vggt": 15.0, "refine": 100.0}
 
@@ -166,6 +203,7 @@ def test_history_ignores_records_from_other_versions(isolated_store):
 # Widgets
 # ---------------------------------------------------------------------------
 
+
 def test_stage_timeline_paints_with_and_without_data(qapp):
     timeline = StageTimeline()
     timeline.resize(600, 74)
@@ -178,6 +216,8 @@ def test_stage_timeline_paints_with_and_without_data(qapp):
     timeline.render(QPixmap(timeline.size()))
     assert "refine" in timeline.toolTip()
     assert "%" in timeline.toolTip()
+    timeline.set_timings({"future_stage": 5.0})
+    assert "future_stage" in timeline.toolTip()
 
 
 def test_qt_labels_are_translated(qapp):
@@ -195,10 +235,12 @@ def test_qt_labels_are_translated(qapp):
 def test_job_picker_lists_and_returns_the_selection(qapp):
     from gui.widgets import JobPickerDialog
 
-    dialog = JobPickerDialog([
-        {"job_id": "aaa", "status": "running", "stage": "refine", "progress": 0.61},
-        {"job_id": "bbb", "status": "done", "stage": "export", "progress": 1.0},
-    ])
+    dialog = JobPickerDialog(
+        [
+            {"job_id": "aaa", "status": "running", "stage": "refine", "progress": 0.61},
+            {"job_id": "bbb", "status": "done", "stage": "export", "progress": 1.0},
+        ]
+    )
 
     assert dialog.table.rowCount() == 2
     assert dialog.selected_job_id() == "aaa"  # première ligne présélectionnée
@@ -217,6 +259,7 @@ def test_metric_card_updates(qapp):
 # ---------------------------------------------------------------------------
 # Scan complet par l'interface
 # ---------------------------------------------------------------------------
+
 
 def test_full_scan_through_the_window(qapp, live_server, frames_dir, tmp_path, isolated_store):
     from gui.main_window import MainWindow
@@ -300,9 +343,7 @@ def test_attach_to_a_job_started_elsewhere(qapp, live_server, frames_dir, tmp_pa
     # Le job est soumis sans passer par l'interface, comme le ferait la CLI.
     client = MinidsClient(url=live_server, token=TEST_TOKEN, timeout=30)
     payload = build_payload(source=frames_dir, workdir=tmp_path / "work")
-    job_id = client.create_job(
-        payload.name, payload.stat().st_size, CHUNK_SIZE, sha256_file(payload), {"frames": 20}
-    )
+    job_id = client.create_job(payload.name, payload.stat().st_size, CHUNK_SIZE, sha256_file(payload), {"frames": 20})
     client.upload(job_id, payload, CHUNK_SIZE, quiet=True)
     client.start(job_id)
 
@@ -336,9 +377,7 @@ def test_attach_to_a_job_started_elsewhere(qapp, live_server, frames_dir, tmp_pa
     window.close()
 
 
-def test_a_crash_mid_scan_leaves_the_job_reachable(
-    qapp, live_server, frames_dir, tmp_path, isolated_store
-):
+def test_a_crash_mid_scan_leaves_the_job_reachable(qapp, live_server, frames_dir, tmp_path, isolated_store):
     """Un scan en cours doit survivre à la disparition brutale de la fenêtre.
 
     L'identifiant est écrit sur disque dès que le pod l'attribue — et non à la
@@ -369,9 +408,7 @@ def test_a_crash_mid_scan_leaves_the_job_reachable(
     window.close()
 
 
-def test_a_pod_without_model_credentials_is_flagged_before_scanning(
-    qapp, tmp_path, isolated_store, monkeypatch
-):
+def test_a_pod_without_model_credentials_is_flagged_before_scanning(qapp, tmp_path, isolated_store, monkeypatch):
     """Un scan condamné à échouer sur `vggt` ne doit pas partir sans avertissement."""
     from PyQt6.QtWidgets import QMessageBox
 
@@ -382,9 +419,7 @@ def test_a_pod_without_model_credentials_is_flagged_before_scanning(
     window.token_edit.setText("jeton")
     window.source_edit.setText(str(tmp_path))
 
-    window._on_health_ok(
-        {"cuda_available": True, "hf_token_configured": False, "checkpoint": "facebook/X:y.pt"}
-    )
+    window._on_health_ok({"cuda_available": True, "hf_token_configured": False, "checkpoint": "facebook/X:y.pt"})
     assert "HF_TOKEN" in window._model_access_warning
 
     asked: list[str] = []
@@ -399,9 +434,7 @@ def test_a_pod_without_model_credentials_is_flagged_before_scanning(
     assert window.scan_worker is None, "le scan ne doit pas partir sur un refus"
 
     # Un pod correctement configuré ne pose aucune question.
-    window._on_health_ok(
-        {"cuda_available": True, "hf_token_configured": True, "checkpoint": "facebook/X:y.pt"}
-    )
+    window._on_health_ok({"cuda_available": True, "hf_token_configured": True, "checkpoint": "facebook/X:y.pt"})
     assert window._model_access_warning == ""
 
     # Un pod d'une version antérieure ne publie pas ces champs : pas d'alerte inventée.
@@ -422,9 +455,7 @@ def test_cancelled_scan_is_not_reported_as_a_crash(qapp, tmp_path, isolated_stor
 
     window = MainWindow()
     window.settings.last_job_id = "job-en-cours"
-    window._on_scan_failed(
-        ScanOutcome(job_id="job-en-cours", status="cancelled", directory=tmp_path, error="annulé")
-    )
+    window._on_scan_failed(ScanOutcome(job_id="job-en-cours", status="cancelled", directory=tmp_path, error="annulé"))
 
     assert not criticals, "une annulation volontaire ne doit pas s'afficher comme une erreur"
     assert window.phase_label.text() == "annulé"
@@ -444,12 +475,180 @@ def test_failed_scan_still_raises_a_dialog(qapp, tmp_path, isolated_store, monke
     monkeypatch.setattr(QMessageBox, "critical", lambda *args, **kwargs: criticals.append(args[2]))
 
     window = MainWindow()
-    window._on_scan_failed(
-        ScanOutcome(job_id="abc", status="failed", directory=tmp_path, error="VRAM insuffisante")
-    )
+    window._on_scan_failed(ScanOutcome(job_id="abc", status="failed", directory=tmp_path, error="VRAM insuffisante"))
 
     assert criticals == ["VRAM insuffisante"]
     window.close()
+
+
+def test_worker_reports_local_cancellation_as_cancelled(qapp, tmp_path, monkeypatch):
+    from client.transport import MinidsError
+    from gui.workers import ScanRequest, ScanWorker
+
+    request = ScanRequest(
+        url="http://127.0.0.1:8000",
+        token="token",
+        source=tmp_path,
+        output_dir=tmp_path / "out",
+        params={},
+    )
+    worker = ScanWorker(request)
+    outcomes = []
+    worker.failed.connect(outcomes.append)
+
+    def cancelled_prepare(*_args):
+        worker._cancelled = True
+        raise MinidsError("interrompu")
+
+    monkeypatch.setattr(worker, "_prepare", cancelled_prepare)
+    worker.run()
+
+    assert outcomes and outcomes[0].status == "cancelled"
+    assert outcomes[0].error == "annulé"
+
+
+def test_worker_keeps_job_reachable_when_remote_cancellation_fails(qapp, tmp_path):
+    from client.transport import MinidsError
+    from gui.workers import ScanOutcome, ScanRequest, ScanWorker
+
+    class OfflineClient:
+        def cancel(self, _job_id):
+            raise MinidsError("réseau indisponible")
+
+    worker = ScanWorker(
+        ScanRequest(
+            url="http://127.0.0.1:8000",
+            token="token",
+            source=tmp_path,
+            output_dir=tmp_path / "out",
+            params={},
+            job_id="job-still-running",
+        )
+    )
+    worker._client = OfflineClient()
+    worker._job_id = "job-still-running"
+    worker._cancelled = True
+    outcomes = []
+    worker.failed.connect(outcomes.append)
+
+    worker._emit_failure(
+        ScanOutcome("job-still-running", "client_error", tmp_path),
+        MinidsError("polling interrompu"),
+        time.monotonic(),
+    )
+
+    assert outcomes[0].status == "client_error"
+    assert outcomes[0].job_id == "job-still-running"
+    assert "non confirmée" in outcomes[0].error
+
+
+def test_detach_before_start_reports_confirmed_remote_cancellation(qapp, tmp_path):
+    from client.transport import MinidsError
+    from gui.workers import ScanOutcome, ScanRequest, ScanWorker
+
+    class CreatedClient:
+        def cancel(self, _job_id):
+            return {"status": "cancelled"}
+
+    worker = ScanWorker(
+        ScanRequest(
+            url="http://127.0.0.1:8000",
+            token="token",
+            source=tmp_path,
+            output_dir=tmp_path / "out",
+            params={},
+        )
+    )
+    worker._client = CreatedClient()
+    worker._job_id = "a" * 32
+    worker._created_locally = True
+    worker._detach_requested = True
+    outcomes = []
+    worker.failed.connect(outcomes.append)
+
+    worker._emit_failure(
+        ScanOutcome("", "client_error", tmp_path),
+        MinidsError("fermeture demandée"),
+        time.monotonic(),
+    )
+
+    assert outcomes[0].status == "cancelled"
+    assert outcomes[0].error == "arrêté avant démarrage"
+
+
+def test_worker_rejects_an_invalid_attached_job_id(qapp, tmp_path):
+    from client.transport import MinidsError
+    from gui.workers import ScanRequest, ScanWorker
+
+    request = ScanRequest(
+        url="http://127.0.0.1:8000",
+        token="token",
+        source=tmp_path,
+        output_dir=tmp_path / "out",
+        params={},
+        job_id="../escape",
+    )
+
+    with pytest.raises(MinidsError, match="identifiant"):
+        ScanWorker(request)._validate_request(request)
+
+
+def test_attach_rejects_a_created_job_instead_of_polling_forever(qapp, tmp_path):
+    from client.transport import MinidsError
+    from gui.workers import ScanOutcome, ScanRequest, ScanWorker
+
+    class CreatedClient:
+        def status(self, _job_id):
+            return {"status": "created", "logs": [], "progress": 0.0}
+
+    job_id = "a" * 32
+    worker = ScanWorker(
+        ScanRequest(
+            url="http://127.0.0.1:8000",
+            token="token",
+            source=tmp_path,
+            output_dir=tmp_path / "out",
+            params={},
+            job_id=job_id,
+        )
+    )
+    worker._client = CreatedClient()
+    with pytest.raises(MinidsError, match="upload incomplet"):
+        worker._wait(ScanOutcome(job_id, "client_error", tmp_path))
+
+
+def test_attach_waits_through_the_starting_state(qapp, tmp_path, monkeypatch):
+    from gui import workers
+    from gui.workers import ScanOutcome, ScanRequest, ScanWorker
+
+    class StartingClient:
+        def __init__(self):
+            self.states = iter(
+                [
+                    {"status": "starting", "logs": [], "progress": 0.0},
+                    {"status": "done", "logs": [], "progress": 1.0},
+                ]
+            )
+
+        def status(self, _job_id):
+            return next(self.states)
+
+    job_id = "a" * 32
+    worker = ScanWorker(
+        ScanRequest(
+            url="http://127.0.0.1:8000",
+            token="token",
+            source=tmp_path,
+            output_dir=tmp_path / "out",
+            params={},
+            job_id=job_id,
+            poll_seconds=0.01,
+        )
+    )
+    worker._client = StartingClient()
+    monkeypatch.setattr(workers.time, "sleep", lambda _delay: None)
+
+    assert worker._wait(ScanOutcome(job_id, "client_error", tmp_path))["status"] == "done"
 
 
 def test_collect_params_matches_server_schema(qapp, isolated_store):
@@ -488,3 +687,22 @@ def test_compare_without_refine_drops_the_2dgs_backend(qapp, isolated_store):
     assert "tsdf2dgs" not in params["mesh_backends"]
     assert params["mesh_backends"][0] == "tsdf"
     window.close()
+
+
+def test_no_refine_maps_a_2dgs_primary_to_tsdf(qapp, isolated_store):
+    from gui.main_window import MainWindow
+
+    window = MainWindow()
+    window._loading_preset = True
+    window.refine_check.setChecked(False)
+    window.backend_combo.setCurrentText("tsdf2dgs")
+    window._loading_preset = False
+    assert window._collect_params()["mesh_backends"] == ["tsdf"]
+    window.close()
+
+
+def test_checkpoint_configured_boolean_is_supported(qapp, isolated_store):
+    from gui.main_window import MainWindow
+
+    assert "MINIDS_CKPT" in MainWindow._missing_model_access({"checkpoint_configured": False})
+    assert MainWindow._missing_model_access({"checkpoint_configured": True}) == ""

@@ -22,7 +22,7 @@ from typing import Any
 
 import numpy as np
 
-from .geometry import SceneNormalization, largest_cluster_mask, unproject
+from .geometry import SceneNormalization, confidence_threshold, largest_cluster_mask, unproject
 from .vggt import VGGTResult
 
 log = logging.getLogger("minids.segment")
@@ -39,9 +39,31 @@ class Segmentation:
     plane: np.ndarray | None = None  # (a, b, c, d) du plan de support
     stats: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        self.masks = np.asarray(self.masks, dtype=bool)
+        if self.masks.ndim != 3 or any(size <= 0 for size in self.masks.shape):
+            raise ValueError(f"masques de forme inattendue: {self.masks.shape}, (S, H, W) attendu")
+        if not self.method:
+            raise ValueError("méthode de segmentation vide")
+        if (self.bbox_min is None) != (self.bbox_max is None):
+            raise ValueError("les deux bornes de la boîte objet sont requises ensemble")
+        if self.bbox_min is not None and self.bbox_max is not None:
+            self.bbox_min = np.asarray(self.bbox_min, dtype=np.float64)
+            self.bbox_max = np.asarray(self.bbox_max, dtype=np.float64)
+            if self.bbox_min.shape != (3,) or self.bbox_max.shape != (3,):
+                raise ValueError("la boîte objet doit contenir deux vecteurs 3D")
+            if not np.isfinite(self.bbox_min).all() or not np.isfinite(self.bbox_max).all():
+                raise ValueError("boîte objet non finie")
+            if np.any(self.bbox_max < self.bbox_min) or np.linalg.norm(self.bbox_max - self.bbox_min) <= 1e-12:
+                raise ValueError("boîte objet vide ou inversée")
+        if self.plane is not None:
+            self.plane = np.asarray(self.plane, dtype=np.float64)
+            if self.plane.shape != (4,) or not np.isfinite(self.plane).all():
+                raise ValueError("plan de support invalide")
+
     @property
     def coverage(self) -> float:
-        return float(self.masks.mean())
+        return float(self.masks.mean()) if self.masks.size else 0.0
 
     def save_pngs(self, directory: Path) -> None:
         directory.mkdir(parents=True, exist_ok=True)
@@ -54,12 +76,12 @@ class Segmentation:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            **self.stats,
             "method": self.method,
             "coverage": round(self.coverage, 4),
             "bbox_min": None if self.bbox_min is None else self.bbox_min.tolist(),
             "bbox_max": None if self.bbox_max is None else self.bbox_max.tolist(),
             "plane": None if self.plane is None else self.plane.tolist(),
-            **self.stats,
         }
 
 
@@ -72,6 +94,15 @@ def segment(
     log_fn: Callable[[str], None] = lambda _m: None,
 ) -> Segmentation:
     """Point d'entrée : choisit la stratégie et garantit un résultat exploitable."""
+    allowed = {"auto", "sam3", "geometric", "none"}
+    if method not in allowed:
+        raise ValueError(f"méthode de segmentation inconnue: {method!r} ({', '.join(sorted(allowed))})")
+    if not np.isfinite(conf_quantile) or not 0.0 <= conf_quantile <= 1.0:
+        raise ValueError(f"quantile de confiance invalide: {conf_quantile!r}")
+    prompt = prompt.strip() if prompt else None
+    if method == "sam3" and not prompt:
+        raise ValueError("un prompt texte non vide est requis pour la segmentation SAM 3")
+
     sequence, height, width = result.depth.shape
 
     if method == "none":
@@ -98,6 +129,7 @@ def segment(
 # SAM 3
 # ---------------------------------------------------------------------------
 
+
 def _segment_sam3(result: VGGTResult, prompt: str, log_fn: Callable[[str], None]) -> np.ndarray:
     import torch
     import transformers
@@ -114,23 +146,29 @@ def _segment_sam3(result: VGGTResult, prompt: str, log_fn: Callable[[str], None]
 
     sequence, height, width = result.depth.shape
     masks = np.zeros((sequence, height, width), dtype=bool)
-    for index in range(sequence):
-        image = Image.fromarray((result.images[index] * 255).astype(np.uint8))
-        inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
-        with torch.inference_mode():
-            outputs = model(**inputs)
-        parsed = processor.post_process_instance_segmentation(
-            outputs, threshold=0.4, mask_threshold=0.5, target_sizes=[(height, width)]
-        )[0]
-        instance_masks = parsed.get("masks")
-        scores = parsed.get("scores")
-        if instance_masks is None or len(instance_masks) == 0:
-            continue
-        best = int(torch.as_tensor(scores).argmax()) if scores is not None else 0
-        masks[index] = np.asarray(torch.as_tensor(instance_masks[best]).cpu()) > 0.5
-
-    del model
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+    try:
+        for index in range(sequence):
+            pixels = (np.clip(result.images[index], 0, 1) * 255).round().astype(np.uint8)
+            image = Image.fromarray(pixels)
+            inputs = processor(images=image, text=prompt, return_tensors="pt").to(device)
+            with torch.inference_mode():
+                outputs = model(**inputs)
+            parsed = processor.post_process_instance_segmentation(
+                outputs, threshold=0.4, mask_threshold=0.5, target_sizes=[(height, width)]
+            )[0]
+            instance_masks = parsed.get("masks")
+            scores = parsed.get("scores")
+            if instance_masks is None or len(instance_masks) == 0:
+                continue
+            best = int(torch.as_tensor(scores).argmax()) if scores is not None else 0
+            mask = np.asarray(torch.as_tensor(instance_masks[best]).cpu()).squeeze()
+            if mask.shape != (height, width):
+                raise ValueError(f"masque SAM 3 de forme inattendue: {mask.shape}")
+            masks[index] = mask > 0.5
+    finally:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     log_fn(f"SAM 3 : {int(masks.any(axis=(1, 2)).sum())}/{sequence} images avec détection")
     return masks
 
@@ -150,7 +188,7 @@ def _refine_with_geometry(
     maillage final. On la déduit des points masqués et confiants.
     """
     masks = _clean_masks(masks)
-    threshold = float(np.percentile(result.depth_conf, 100.0 * conf_quantile))
+    threshold = confidence_threshold(result.depth_conf, 1.0 - conf_quantile)
 
     collected = []
     for index in range(len(result.depth)):
@@ -189,11 +227,14 @@ def _refine_with_geometry(
 # Repli géométrique
 # ---------------------------------------------------------------------------
 
+
 def _confident_points(
     result: VGGTResult, normalization: SceneNormalization, conf_quantile: float, stride: int = 2
 ) -> tuple[np.ndarray, np.ndarray]:
     """Nuage normalisé des pixels les plus confiants + seuil retenu."""
-    threshold = float(np.percentile(result.depth_conf, 100.0 * conf_quantile))
+    if not isinstance(stride, (int, np.integer)) or isinstance(stride, (bool, np.bool_)) or stride <= 0:
+        raise ValueError(f"pas d'échantillonnage invalide: {stride!r}")
+    threshold = confidence_threshold(result.depth_conf, 1.0 - conf_quantile)
     clouds = []
     for index in range(len(result.depth)):
         depth = result.depth[index]
@@ -217,6 +258,10 @@ def _segment_geometric(
 ) -> Segmentation:
     import open3d as o3d
 
+    random_api = getattr(o3d.utility, "random", None)
+    if random_api is not None and hasattr(random_api, "seed"):
+        random_api.seed(0)
+
     points, threshold = _confident_points(result, normalization, conf_quantile)
     log_fn(f"segmentation géométrique sur {len(points)} points")
 
@@ -233,8 +278,12 @@ def _segment_geometric(
         if inlier_ratio > 0.12:  # un vrai plan de support, pas trois points alignés
             plane_model = np.asarray(model, dtype=np.float64)
             centers_side = _camera_side(plane_model, result, normalization)
+            # Convention transmise au nettoyage : l'objet et les caméras sont
+            # toujours du côté positif, quel que soit le signe choisi par RANSAC.
+            if centers_side < 0:
+                plane_model = -plane_model
             signed = reduced @ plane_model[:3] + plane_model[3]
-            keep = (np.abs(signed) > 0.02) & (np.sign(signed) == centers_side)
+            keep = signed > 0.02
             remaining = reduced[keep]
             log_fn(f"plan de support retiré ({inlier_ratio:.0%} des points)")
 
@@ -299,10 +348,15 @@ def _masks_from_box(
 
 def _clean_masks(masks: np.ndarray, min_area_ratio: float = 0.15) -> np.ndarray:
     """Fermeture morphologique + plus grande composante connexe 2D."""
+    masks = np.asarray(masks, dtype=bool)
+    if masks.ndim != 3:
+        raise ValueError(f"masques de forme inattendue: {masks.shape}, (S, H, W) attendu")
+    if not np.isfinite(min_area_ratio) or not 0.0 <= min_area_ratio <= 1.0:
+        raise ValueError(f"ratio d'aire invalide: {min_area_ratio!r}")
     try:
         import cv2
     except ImportError:  # pragma: no cover - OpenCV absent : on garde le masque brut
-        return masks
+        return masks.copy()
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     cleaned = np.zeros_like(masks)
@@ -310,6 +364,8 @@ def _clean_masks(masks: np.ndarray, min_area_ratio: float = 0.15) -> np.ndarray:
         binary = (mask * 255).astype(np.uint8)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        if mask.any() and not binary.any():
+            binary = (mask * 255).astype(np.uint8)
         count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
         if count <= 1:
             continue

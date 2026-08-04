@@ -63,18 +63,25 @@ def painted_scene():
         images[index] = np.where(hit[..., None], colors, 0.0)
 
     return {
-        "truth": mesh, "extrinsics": extrinsics, "intrinsics": intrinsics,
-        "depths": depths, "masks": masks, "images": images,
+        "truth": mesh,
+        "extrinsics": extrinsics,
+        "intrinsics": intrinsics,
+        "depths": depths,
+        "masks": masks,
+        "images": images,
     }
 
 
 @pytest.fixture(scope="module")
 def reconstructed(painted_scene):
     mesh = mesh_tsdf.fuse(
-        depths=painted_scene["depths"], colors=painted_scene["images"],
-        intrinsics=painted_scene["intrinsics"], extrinsics=painted_scene["extrinsics"],
+        depths=painted_scene["depths"],
+        colors=painted_scene["images"],
+        intrinsics=painted_scene["intrinsics"],
+        extrinsics=painted_scene["extrinsics"],
         config=mesh_tsdf.TSDFConfig(voxel_size=0.006, depth_max=5.0),
-        masks=painted_scene["masks"], device="CPU:0",
+        masks=painted_scene["masks"],
+        device="CPU:0",
     )
     return cleanup_module.clean(
         mesh, cleanup_module.CleanupConfig(target_triangles=30_000, watertight=False), voxel_size=0.006
@@ -156,6 +163,7 @@ def test_image_sharpness_ranks_blurred_images_lower():
 # Re-maillage local depuis vggt_raw.npz
 # ---------------------------------------------------------------------------
 
+
 def write_raw_npz(path, painted_scene, normalization: SceneNormalization):
     result = VGGTResult(
         depth=painted_scene["depths"],
@@ -199,8 +207,13 @@ def test_remesh_produces_a_valid_glb(tmp_path, painted_scene):
     output = tmp_path / "remesh.glb"
 
     metrics = remesh(
-        npz_path=raw, output=output, backend="tsdf", voxel_divisor=200,
-        target_triangles=20_000, watertight=False, log_fn=lambda _m: None,
+        npz_path=raw,
+        output=output,
+        backend="tsdf",
+        voxel_divisor=200,
+        target_triangles=20_000,
+        watertight=False,
+        log_fn=lambda _m: None,
     )
 
     assert metrics["triangles"] > 1_000
@@ -217,8 +230,14 @@ def test_remesh_scales_to_real_world_size(tmp_path, painted_scene):
     output = tmp_path / "remesh.glb"
 
     remesh(
-        npz_path=raw, output=output, backend="tsdf", voxel_divisor=128,
-        target_triangles=10_000, watertight=False, ref_size=0.28, log_fn=lambda _m: None,
+        npz_path=raw,
+        output=output,
+        backend="tsdf",
+        voxel_divisor=128,
+        target_triangles=10_000,
+        watertight=False,
+        ref_size=0.28,
+        log_fn=lambda _m: None,
     )
 
     summary = read_glb_summary(output)

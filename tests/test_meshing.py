@@ -157,13 +157,20 @@ def test_tsdf_reconstructs_the_object(synthetic):
 
 def test_poisson_reconstructs_the_object(synthetic):
     points, colors = mesh_poisson.point_cloud_from_depths(
-        synthetic["depths"], synthetic["colors"], synthetic["intrinsics"], synthetic["extrinsics"],
-        masks=synthetic["masks"], depth_max=5.0, stride=2,
+        synthetic["depths"],
+        synthetic["colors"],
+        synthetic["intrinsics"],
+        synthetic["extrinsics"],
+        masks=synthetic["masks"],
+        depth_max=5.0,
+        stride=2,
     )
     assert len(points) > 10_000
 
     mesh = mesh_poisson.reconstruct(
-        points, colors, synthetic["extrinsics"],
+        points,
+        colors,
+        synthetic["extrinsics"],
         mesh_poisson.PoissonConfig(depth=8, voxel_size=0.005),
     )
 
@@ -175,10 +182,13 @@ def test_poisson_reconstructs_the_object(synthetic):
 def test_cleanup_removes_stray_islands(synthetic):
     """Un îlot parasite loin de l'objet doit disparaître, sans abîmer l'objet."""
     mesh = mesh_tsdf.fuse(
-        depths=synthetic["depths"], colors=synthetic["colors"],
-        intrinsics=synthetic["intrinsics"], extrinsics=synthetic["extrinsics"],
+        depths=synthetic["depths"],
+        colors=synthetic["colors"],
+        intrinsics=synthetic["intrinsics"],
+        extrinsics=synthetic["extrinsics"],
         config=mesh_tsdf.TSDFConfig(voxel_size=0.008, depth_max=5.0),
-        masks=synthetic["masks"], device="CPU:0",
+        masks=synthetic["masks"],
+        device="CPU:0",
     )
     island = o3d.geometry.TriangleMesh.create_sphere(radius=0.02, resolution=6)
     island.translate((0.9, 0.9, 0.9))
@@ -199,10 +209,13 @@ def test_cleanup_removes_stray_islands(synthetic):
 
 def test_cleanup_respects_triangle_budget(synthetic):
     mesh = mesh_tsdf.fuse(
-        depths=synthetic["depths"], colors=synthetic["colors"],
-        intrinsics=synthetic["intrinsics"], extrinsics=synthetic["extrinsics"],
+        depths=synthetic["depths"],
+        colors=synthetic["colors"],
+        intrinsics=synthetic["intrinsics"],
+        extrinsics=synthetic["extrinsics"],
         config=mesh_tsdf.TSDFConfig(voxel_size=0.004, depth_max=5.0),
-        masks=synthetic["masks"], device="CPU:0",
+        masks=synthetic["masks"],
+        device="CPU:0",
     )
     cleaned = cleanup_module.clean(
         mesh, cleanup_module.CleanupConfig(target_triangles=8_000, watertight=False), voxel_size=0.004

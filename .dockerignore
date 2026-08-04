@@ -1,8 +1,9 @@
 .git
-.venv
+.venv*/
 out/
 data/
 bench_out/
+htmlcov/
 tests/
 **/__pycache__/
 *.pyc
@@ -11,3 +12,6 @@ tests/
 *.glb
 *.npz
 .pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml

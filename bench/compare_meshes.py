@@ -31,12 +31,52 @@ from server.pipeline import mesh_poisson, mesh_tsdf  # noqa: E402
 from server.pipeline.remesh import load_raw  # noqa: E402
 
 SAMPLE_POINTS = 200_000
+SUPPORTED_BACKENDS = frozenset({"tsdf", "poisson"})
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"entier attendu, reçu {value!r}") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("la valeur doit être strictement positive")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"nombre attendu, reçu {value!r}") from exc
+    if not np.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("la valeur doit être un nombre strictement positif")
+    return parsed
+
+
+def _parse_backends(value: str) -> list[str]:
+    backends = list(dict.fromkeys(item.strip().lower() for item in value.split(",") if item.strip()))
+    if not backends:
+        raise argparse.ArgumentTypeError("au moins un backend est requis")
+    unsupported = [backend for backend in backends if backend not in SUPPORTED_BACKENDS]
+    if unsupported:
+        choices = ", ".join(sorted(SUPPORTED_BACKENDS))
+        raise argparse.ArgumentTypeError(f"backend inconnu: {', '.join(unsupported)} (choix: {choices})")
+    return backends
 
 
 def build_meshes(
     raw: Path, backends: list[str], voxel_divisor: int, target_triangles: int, device: str, use_masks: bool
 ) -> dict[str, dict[str, Any]]:
     from server.pipeline.geometry import unproject
+
+    if voxel_divisor <= 0 or target_triangles <= 0:
+        raise ValueError("voxel_divisor et target_triangles doivent être strictement positifs")
+    if not backends:
+        raise ValueError("au moins un backend est requis")
+    unsupported = [backend for backend in backends if backend not in SUPPORTED_BACKENDS]
+    if unsupported:
+        raise ValueError(f"backend de benchmark inconnu: {', '.join(unsupported)}")
 
     result, normalization, masks = load_raw(raw)
     if not use_masks:
@@ -51,6 +91,8 @@ def build_meshes(
             keep &= masks[index]
         if keep.any():
             collected.append(unproject(depths[index], result.intrinsics[index], extrinsics[index])[keep][::7])
+    if not collected:
+        raise ValueError("aucun point 3D valide dans les profondeurs sélectionnées")
     points = np.concatenate(collected)
     bbox_min = np.percentile(points, 0.5, axis=0)
     bbox_max = np.percentile(points, 99.5, axis=0)
@@ -61,38 +103,81 @@ def build_meshes(
         started = time.time()
         if backend == "tsdf":
             mesh = mesh_tsdf.fuse(
-                depths=depths, colors=result.images, intrinsics=result.intrinsics, extrinsics=extrinsics,
-                config=mesh_tsdf.TSDFConfig(voxel_size=voxel_size), masks=masks, device=device, log_fn=print,
+                depths=depths,
+                colors=result.images,
+                intrinsics=result.intrinsics,
+                extrinsics=extrinsics,
+                config=mesh_tsdf.TSDFConfig(voxel_size=voxel_size),
+                masks=masks,
+                device=device,
+                log_fn=print,
             )
         elif backend == "poisson":
             cloud_points, cloud_colors = mesh_poisson.point_cloud_from_depths(
                 depths, result.images, result.intrinsics, extrinsics, masks=masks
             )
             mesh = mesh_poisson.reconstruct(
-                cloud_points, cloud_colors, extrinsics,
-                mesh_poisson.PoissonConfig(voxel_size=voxel_size), print,
+                cloud_points,
+                cloud_colors,
+                extrinsics,
+                mesh_poisson.PoissonConfig(voxel_size=voxel_size),
+                print,
             )
-        else:
-            print(f"backend '{backend}' ignoré (non reproductible hors pipeline complet)")
-            continue
+        else:  # protégé par la validation ci-dessus
+            raise RuntimeError(f"backend non validé: {backend}")
 
         mesh = cleanup_module.clean(
-            mesh, cleanup_module.CleanupConfig(target_triangles=target_triangles),
-            bbox_min, bbox_max, None, voxel_size, print,
+            mesh,
+            cleanup_module.CleanupConfig(target_triangles=target_triangles),
+            bbox_min,
+            bbox_max,
+            None,
+            voxel_size,
+            print,
         )
+        if not len(mesh.vertices) or not len(mesh.triangles):
+            raise ValueError(f"maillage {backend} vide après nettoyage")
         outputs[backend] = {"mesh": mesh, "seconds": round(time.time() - started, 2)}
     return outputs
 
 
-def load_reference(path: Path, from_glb: bool) -> Any:
+def reference_export_scale(path: Path, explicit: float | None = None) -> float:
+    """Facteur d'export du GLB, explicite ou lu dans le report frère du job."""
+    if explicit is not None:
+        if not np.isfinite(explicit) or explicit <= 0:
+            raise ValueError(f"échelle de référence invalide: {explicit!r}")
+        return float(explicit)
+    report_path = Path(path).with_name("report.json")
+    if not report_path.is_file():
+        return 1.0
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"report de référence illisible: {report_path}") from exc
+    if not isinstance(report, dict) or "export_scale" not in report:
+        return 1.0
+    try:
+        scale = float(report["export_scale"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"export_scale invalide dans {report_path}") from exc
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError(f"export_scale invalide dans {report_path}: {scale!r}")
+    return scale
+
+
+def load_reference(path: Path, from_glb: bool, export_scale: float = 1.0) -> Any:
     import open3d as o3d
 
+    if not np.isfinite(export_scale) or export_scale <= 0:
+        raise ValueError(f"échelle de référence invalide: {export_scale!r}")
     mesh = o3d.io.read_triangle_mesh(str(path))
     if not len(mesh.triangles):
         raise ValueError(f"maillage de référence vide: {path}")
+    vertices = np.asarray(mesh.vertices) / export_scale
     if from_glb:
         # Annule la conversion d'axes appliquée à l'export (rotation involutive).
-        mesh.vertices = o3d.utility.Vector3dVector(np.asarray(mesh.vertices) @ COLMAP_TO_GLTF.T)
+        vertices = vertices @ COLMAP_TO_GLTF.T
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
     return mesh
 
 
@@ -116,32 +201,51 @@ def chamfer(mesh_a: Any, mesh_b: Any, samples: int = SAMPLE_POINTS) -> dict[str,
 
 def normalized_scale(mesh: Any) -> float:
     vertices = np.asarray(mesh.vertices)
-    return float(np.linalg.norm(vertices.max(axis=0) - vertices.min(axis=0))) or 1.0
+    if vertices.ndim != 2 or vertices.shape[1:] != (3,) or not len(vertices) or not np.isfinite(vertices).all():
+        raise ValueError("maillage vide ou invalide pour la normalisation du benchmark")
+    scale = float(np.linalg.norm(vertices.max(axis=0) - vertices.min(axis=0)))
+    if scale <= np.finfo(np.float64).eps:
+        raise ValueError("maillage dégénéré: étendue nulle pour la normalisation du benchmark")
+    return scale
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--raw", type=Path, required=True, help="vggt_raw.npz du job")
     parser.add_argument("--reference", type=Path, default=None, help="mesh.glb de référence (2DGS→TSDF)")
-    parser.add_argument("--backends", default="tsdf,poisson")
+    parser.add_argument(
+        "--reference-scale",
+        type=_positive_float,
+        default=None,
+        help="facteur d'export à annuler (auto depuis le report.json voisin)",
+    )
+    parser.add_argument("--backends", type=_parse_backends, default=["tsdf", "poisson"])
     parser.add_argument("--out", type=Path, default=Path("bench_out"))
-    parser.add_argument("--voxel-divisor", type=int, default=512)
-    parser.add_argument("--target-triangles", type=int, default=200_000)
+    parser.add_argument("--voxel-divisor", type=_positive_int, default=512)
+    parser.add_argument("--target-triangles", type=_positive_int, default=200_000)
     parser.add_argument("--device", default="CPU:0", help="CUDA:0 sur le pod, CPU:0 en local")
     parser.add_argument("--no-masks", action="store_true")
     args = parser.parse_args(argv)
 
+    if not args.raw.is_file():
+        parser.error(f"fichier brut introuvable: {args.raw}")
+    if args.reference is not None and not args.reference.is_file():
+        parser.error(f"maillage de référence introuvable: {args.reference}")
+
     from common.glb import write_glb
 
     args.out.mkdir(parents=True, exist_ok=True)
-    backends = [b.strip() for b in args.backends.split(",") if b.strip()]
     results = build_meshes(
-        args.raw, backends, args.voxel_divisor, args.target_triangles, args.device, not args.no_masks
+        args.raw, args.backends, args.voxel_divisor, args.target_triangles, args.device, not args.no_masks
     )
 
     reference = None
-    if args.reference and Path(args.reference).exists():
-        reference = load_reference(Path(args.reference), Path(args.reference).suffix.lower() == ".glb")
+    if args.reference:
+        try:
+            export_scale = reference_export_scale(args.reference, args.reference_scale)
+            reference = load_reference(args.reference, args.reference.suffix.lower() == ".glb", export_scale)
+        except ValueError as exc:
+            parser.error(str(exc))
         results["reference (2dgs→tsdf)"] = {"mesh": reference, "seconds": None}
 
     rows: list[dict[str, Any]] = []
@@ -176,9 +280,13 @@ def main(argv: list[str] | None = None) -> int:
 
 def render_markdown(rows: list[dict[str, Any]]) -> str:
     headers = [
-        ("backend", "Backend"), ("seconds", "Temps (s)"), ("triangles", "Triangles"),
-        ("watertight", "Étanche"), ("surface_area", "Aire"),
-        ("chamfer_mean", "Chamfer moy. (% diag)"), ("hausdorff_p95", "P95 (% diag)"),
+        ("backend", "Backend"),
+        ("seconds", "Temps (s)"),
+        ("triangles", "Triangles"),
+        ("watertight", "Étanche"),
+        ("surface_area", "Aire"),
+        ("chamfer_mean", "Chamfer moy. (% diag)"),
+        ("hausdorff_p95", "P95 (% diag)"),
     ]
     lines = [
         "# Benchmark des backends de maillage",

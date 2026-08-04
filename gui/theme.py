@@ -18,7 +18,7 @@ SUCCESS = "#3ecf8e"
 WARNING = "#f2b545"
 DANGER = "#ff6b6b"
 
-# Couleurs des étapes du pipeline, dans l'ordre de `server.jobs.STAGES`.
+# Couleurs des étapes du pipeline, dans leur ordre d'affichage côté client.
 # Progression du bleu (acquisition) au vert (production du livrable).
 STAGE_COLORS = {
     "ingest": "#5b7cfa",
@@ -95,10 +95,10 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit {{
     padding: 6px 8px;
     selection-background-color: {ACCENT_DIM};
 }}
-QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{
+QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus, QPlainTextEdit:focus {{
     border-color: {ACCENT};
 }}
-QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
+QLineEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QComboBox:disabled {{
     color: {TEXT_DIM};
     background-color: {SURFACE};
 }}
@@ -118,6 +118,7 @@ QPushButton {{
     color: {TEXT};
 }}
 QPushButton:hover {{ border-color: {ACCENT}; }}
+QPushButton:focus {{ border: 2px solid {ACCENT}; padding: 6px 15px; }}
 QPushButton:pressed {{ background-color: {BORDER}; }}
 QPushButton:disabled {{ color: {TEXT_DIM}; border-color: {BORDER}; background: {SURFACE}; }}
 QPushButton#primary {{
@@ -141,16 +142,10 @@ QProgressBar {{
 }}
 QProgressBar::chunk {{ background-color: {ACCENT}; border-radius: 5px; }}
 
-/* Sans cela, la case peint le fond de la fenêtre par-dessus celui du groupe :
-   une bande sombre en travers du formulaire, qu'on lit comme un champ vide. */
-QCheckBox {{ background: transparent; }}
-QCheckBox::indicator {{
-    width: 16px; height: 16px;
-    border: 1px solid {BORDER};
-    border-radius: 4px;
-    background: {SURFACE_HIGH};
-}}
-QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+/* Conserver l'indicateur natif Fusion : il dessine une vraie coche. Un simple
+   carré bleu distinguait l'état uniquement par la couleur. */
+QCheckBox {{ background: transparent; spacing: 7px; }}
+QCheckBox:focus {{ color: #ffffff; }}
 
 QPlainTextEdit#log {{
     font-family: "Cascadia Mono", "Consolas", monospace;

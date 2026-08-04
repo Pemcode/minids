@@ -117,8 +117,13 @@ def test_densification_survives_the_gsplat_tensor_shapes(scene, monkeypatch):
     minutes de GPU.
     """
     config = RefineConfig(
-        iterations=6, densify=True, densify_from=1, densify_every=1,
-        densify_until_ratio=1.0, opacity_reset_every=0, max_gaussians=POINTS * 4,
+        iterations=6,
+        densify=True,
+        densify_from=1,
+        densify_every=1,
+        densify_until_ratio=1.0,
+        opacity_reset_every=0,
+        max_gaussians=POINTS * 4,
     )
     result = run(scene, monkeypatch, gsplat_like_rasterization, config)
 

@@ -54,6 +54,41 @@ class RefineConfig:
     lr_colors: float = 2.5e-3
     seed: int = 0
 
+    def __post_init__(self) -> None:
+        for name in ("iterations", "max_gaussians", "init_points", "densify_every"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_)) or value <= 0:
+                raise ValueError(f"{name} invalide: {value!r}")
+        for name in ("densify_from", "opacity_reset_every"):
+            value = getattr(self, name)
+            if not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_)) or value < 0:
+                raise ValueError(f"{name} invalide: {value!r}")
+        for name in ("densify_until_ratio", "depth_decay_ratio"):
+            value = getattr(self, name)
+            if not np.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} invalide: {value!r}")
+        if not np.isfinite(self.prune_opacity) or not 0.0 <= self.prune_opacity < 1.0:
+            raise ValueError(f"seuil d'opacité invalide: {self.prune_opacity!r}")
+        if not np.isfinite(self.lambda_ssim) or not 0.0 <= self.lambda_ssim <= 1.0:
+            raise ValueError(f"poids SSIM invalide: {self.lambda_ssim!r}")
+        for name in (
+            "grad_threshold",
+            "lambda_alpha",
+            "lambda_normal",
+            "lambda_distort",
+            "lambda_depth",
+            "lr_means",
+            "lr_scales",
+            "lr_quats",
+            "lr_opacities",
+            "lr_colors",
+        ):
+            value = getattr(self, name)
+            if not np.isfinite(value) or value < 0:
+                raise ValueError(f"{name} invalide: {value!r}")
+        if not isinstance(self.seed, (int, np.integer)) or isinstance(self.seed, (bool, np.bool_)):
+            raise ValueError(f"graine aléatoire invalide: {self.seed!r}")
+
 
 @dataclass
 class RefineResult:
@@ -78,8 +113,17 @@ def _import_gsplat() -> Any:
 def _unpack_render(outputs: Any) -> dict[str, Any]:
     """`rasterization_2dgs` renvoie 7 valeurs ; on tolère les variantes."""
     if isinstance(outputs, dict):
-        return outputs
-    values = list(outputs)
+        unpacked = dict(outputs)
+        unpacked.setdefault("meta", {})
+        if "colors" not in unpacked or "alphas" not in unpacked:
+            raise RuntimeError(f"sortie gsplat inattendue (clés: {sorted(unpacked)})")
+        return unpacked
+    try:
+        values = list(outputs)
+    except TypeError as exc:
+        raise RuntimeError(f"sortie gsplat non itérable: {type(outputs).__name__}") from exc
+    if len(values) < 3:
+        raise RuntimeError(f"sortie gsplat inattendue ({len(values)} valeurs)")
     meta = values[-1]
     keys = ["colors", "alphas", "normals", "surf_normals", "distort", "median_depth"]
     unpacked: dict[str, Any] = {"meta": meta}
@@ -93,12 +137,20 @@ def _unpack_render(outputs: Any) -> dict[str, Any]:
 
 def _nearest_neighbour_scale(points: np.ndarray) -> np.ndarray:
     """Distance au plus proche voisin, pour dimensionner les gaussiennes initiales."""
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1:] != (3,) or not len(points) or not np.isfinite(points).all():
+        raise ValueError(f"points initiaux invalides: {points.shape}")
+    if len(points) == 1:
+        return np.full(1, 0.01, dtype=np.float64)
+
     import open3d as o3d
 
     cloud = o3d.geometry.PointCloud()
     cloud.points = o3d.utility.Vector3dVector(points)
     distances = np.asarray(cloud.compute_nearest_neighbor_distance())
-    distances = np.where(np.isfinite(distances) & (distances > 1e-6), distances, np.median(distances))
+    valid = distances[np.isfinite(distances) & (distances > 1e-6)]
+    fallback = float(np.median(valid)) if valid.size else 0.01
+    distances = np.where(np.isfinite(distances) & (distances > 1e-6), distances, fallback)
     return np.clip(distances, 1e-4, 0.05)
 
 
@@ -131,6 +183,12 @@ class GaussianModel:
     def __init__(self, points: np.ndarray, colors: np.ndarray, config: RefineConfig, device: str) -> None:
         import torch
 
+        points = np.asarray(points, dtype=np.float32)
+        colors = np.asarray(colors, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1:] != (3,) or not len(points) or not np.isfinite(points).all():
+            raise ValueError(f"points initiaux invalides: {points.shape}")
+        if colors.shape != points.shape or not np.isfinite(colors).all():
+            raise ValueError(f"couleurs initiales invalides: {colors.shape}")
         self.config = config
         self.device = device
         scales = _nearest_neighbour_scale(points)
@@ -216,7 +274,9 @@ class GaussianModel:
             new_values = torch.cat([parameter.detach()[keep], extensions[name]], dim=0)
             new_parameter = torch.nn.Parameter(new_values)
             if state is not None:
-                zeros = torch.zeros((len(extensions[name]), *parameter.shape[1:]), device=self.device)
+                zeros = torch.zeros(
+                    (len(extensions[name]), *parameter.shape[1:]), device=self.device, dtype=parameter.dtype
+                )
                 state["exp_avg"] = torch.cat([state["exp_avg"][keep], zeros], dim=0)
                 state["exp_avg_sq"] = torch.cat([state["exp_avg_sq"][keep], zeros], dim=0)
                 del self.optimizer.state[parameter]
@@ -263,7 +323,7 @@ class GaussianModel:
             source = getattr(self, name).detach()
             extensions[name] = torch.cat([source[clone_index], source[split_index]])
 
-        keep = opacity.squeeze() > config.prune_opacity
+        keep = opacity > config.prune_opacity
         keep &= largest < 0.5 * scene_extent  # gaussiennes géantes = artefacts de fond
         if int(keep.sum()) < 100:  # garde-fou : ne jamais vider le modèle
             keep = torch.ones_like(keep)
@@ -308,14 +368,72 @@ def refine(
     """Optimise les surfels puis rend profondeur/alpha/couleur pour chaque vue."""
     import torch
 
+    images = np.asarray(images, dtype=np.float32)
+    masks = np.asarray(masks, dtype=bool)
+    depths = np.asarray(depths, dtype=np.float32)
+    depth_weights = np.asarray(depth_weights, dtype=np.float32)
+    viewmats = np.asarray(viewmats, dtype=np.float32)
+    intrinsics = np.asarray(intrinsics, dtype=np.float32)
+    init_points = np.asarray(init_points, dtype=np.float32)
+    init_colors = np.asarray(init_colors, dtype=np.float32)
+    if depths.ndim != 3 or any(size <= 0 for size in depths.shape):
+        raise ValueError(f"profondeurs de raffinement invalides: {depths.shape}")
+    sequence, height, width = depths.shape
+    expected = {
+        "images": (sequence, height, width, 3),
+        "masks": depths.shape,
+        "depth_weights": depths.shape,
+        "viewmats": (sequence, 4, 4),
+        "intrinsics": (sequence, 3, 3),
+    }
+    observed = {
+        "images": images.shape,
+        "masks": masks.shape,
+        "depth_weights": depth_weights.shape,
+        "viewmats": viewmats.shape,
+        "intrinsics": intrinsics.shape,
+    }
+    mismatches = [
+        f"{name}={observed[name]} (attendu {shape})" for name, shape in expected.items() if observed[name] != shape
+    ]
+    if mismatches:
+        raise ValueError("entrées 2DGS incompatibles: " + ", ".join(mismatches))
+    if init_points.ndim != 2 or init_points.shape[1:] != (3,) or not len(init_points):
+        raise ValueError(f"points initiaux invalides: {init_points.shape}")
+    if init_colors.shape != init_points.shape:
+        raise ValueError(f"couleurs initiales incompatibles: {init_colors.shape}")
+    if not masks.any():
+        raise ValueError("masques 2DGS entièrement vides")
+    for name, array in (
+        ("images", images),
+        ("depth_weights", depth_weights),
+        ("viewmats", viewmats),
+        ("intrinsics", intrinsics),
+        ("init_points", init_points),
+        ("init_colors", init_colors),
+    ):
+        if not np.isfinite(array).all():
+            raise ValueError(f"{name} contient des valeurs non finies")
+    if np.any(depth_weights < 0):
+        raise ValueError("les poids de profondeur 2DGS doivent être positifs")
+    if np.any(np.abs(intrinsics[:, (0, 1), (0, 1)]) <= 1e-12):
+        raise ValueError("focale 2DGS nulle")
+    device = str(torch.device(device))
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("raffinement CUDA demandé mais CUDA est indisponible")
+
     rasterization_2dgs = _import_gsplat()
     torch.manual_seed(config.seed)
     rng = np.random.default_rng(config.seed)
 
-    sequence, height, width = depths.shape
-    if len(init_points) > config.init_points:
-        selection = rng.choice(len(init_points), size=config.init_points, replace=False)
+    initial_limit = min(config.init_points, config.max_gaussians)
+    if len(init_points) > initial_limit:
+        selection = np.sort(rng.choice(len(init_points), size=initial_limit, replace=False))
         init_points, init_colors = init_points[selection], init_colors[selection]
+
+    valid_depth = np.isfinite(depths) & (depths > 0)
+    depth_weights = np.where(valid_depth, depth_weights, 0.0).astype(np.float32)
+    depths = np.where(valid_depth, depths, 0.0).astype(np.float32)
 
     model = GaussianModel(init_points, init_colors, config, device)
     log_fn(f"{len(model)} gaussiennes initiales, {config.iterations} itérations")
@@ -367,7 +485,9 @@ def refine(
 
         # Photométrie, restreinte à l'objet (le fond n'a aucune raison d'être appris).
         l1 = ((rgb - target_rgb).abs().mean(dim=-1) * mask).sum() / mask_sum
-        ssim = _ssim((rgb * mask[..., None]).permute(2, 0, 1)[None], (target_rgb * mask[..., None]).permute(2, 0, 1)[None])
+        ssim = _ssim(
+            (rgb * mask[..., None]).permute(2, 0, 1)[None], (target_rgb * mask[..., None]).permute(2, 0, 1)[None]
+        )
         loss = (1.0 - config.lambda_ssim) * l1 + config.lambda_ssim * (1.0 - ssim)
 
         # L'opacité doit suivre le masque : c'est ce qui élimine les gaussiennes de fond.
@@ -387,6 +507,9 @@ def refine(
             weight = weights_t[view] * mask
             depth_loss = ((rendered_depth - depths_t[view]).abs() * weight).sum() / weight.sum().clamp(min=1.0)
             loss = loss + config.lambda_depth * decay * depth_loss
+
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"perte 2DGS non finie à l'itération {iteration}")
 
         model.optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -462,16 +585,24 @@ def render_views(
             alpha = render["alphas"][0, ..., 0]
 
             median = render.get("median_depth")
+            fallback_depth = rendered[..., 3] if rendered.shape[-1] > 3 else torch.zeros_like(alpha)
             depth = None
             if median is not None:
                 depth = median[0]
                 depth = depth[..., 0] if depth.ndim == 3 else depth
-            if depth is None or not torch.isfinite(depth).any() or float(depth.max()) <= 0:
-                depth = rendered[..., 3] if rendered.shape[-1] > 3 else torch.zeros_like(alpha)
+            if depth is None:
+                depth = fallback_depth
+            else:
+                usable = torch.isfinite(depth) & (depth > 0)
+                depth = torch.where(usable, depth, fallback_depth)
+
+            depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0)
+            alpha = torch.nan_to_num(alpha, nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
+            rgb = torch.nan_to_num(rendered[..., :3], nan=0.0, posinf=1.0, neginf=0.0).clamp(0, 1)
 
             depths.append(depth.float().cpu().numpy())
             alphas.append(alpha.float().cpu().numpy())
-            colors.append(rendered[..., :3].clamp(0, 1).float().cpu().numpy())
+            colors.append(rgb.float().cpu().numpy())
 
     return RefineResult(
         depths=np.stack(depths).astype(np.float32),
