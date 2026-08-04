@@ -142,10 +142,25 @@ QProgressBar {{
 }}
 QProgressBar::chunk {{ background-color: {ACCENT}; border-radius: 5px; }}
 
-/* Conserver l'indicateur natif Fusion : il dessine une vraie coche. Un simple
-   carré bleu distinguait l'état uniquement par la couleur. */
 QCheckBox {{ background: transparent; spacing: 7px; }}
 QCheckBox:focus {{ color: #ffffff; }}
+/* L'indicateur natif de Fusion ne survit pas à une feuille de style posée sur
+   QCheckBox : Qt cesse alors d'en peindre la boîte, et une case cochée ne se
+   distingue plus d'une case vide sur ce fond sombre (corriger la palette n'y
+   change rien — vérifié). On le redessine donc explicitement. L'état ne tient
+   pas qu'à la teinte : boîte vide sombre contre boîte pleine claire restent
+   distinctes en niveaux de gris. */
+QCheckBox::indicator {{
+    width: 16px; height: 16px;
+    border: 1px solid {BORDER};
+    border-radius: 4px;
+    background: {SURFACE_HIGH};
+}}
+QCheckBox::indicator:hover {{ border-color: {ACCENT}; }}
+QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+/* L'état se place sur le sous-contrôle : `QCheckBox:focus::indicator` dessine
+   un cadre permanent autour de la case entière, dans tous les états. */
+QCheckBox::indicator:focus {{ border: 2px solid #ffffff; }}
 
 QPlainTextEdit#log {{
     font-family: "Cascadia Mono", "Consolas", monospace;
