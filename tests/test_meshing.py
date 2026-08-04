@@ -155,6 +155,45 @@ def test_tsdf_reconstructs_the_object(synthetic):
     assert np.allclose(reconstructed.max(axis=0), truth.max(axis=0), atol=0.05)
 
 
+def test_tensor_tsdf_reconstructs_the_object(synthetic):
+    """Le chemin `fuse_gpu`, celui qui tourne réellement sur le pod.
+
+    `fuse()` aiguille sur le device : « CPU:0 » part vers l'API héritée
+    (`ScalableTSDFVolume`), tout le reste vers l'API tensor
+    (`VoxelBlockGrid`). Les autres tests n'empruntent donc que la première, et
+    la seconde n'était pas couverte — c'est elle qui a échoué en production sur
+    « Expected (float, float) or (uint16, uint8) ».
+
+    L'API tensor fonctionne aussi sur CPU : on l'appelle ici directement, sans
+    passer par l'aiguillage, ce qui la rend testable sans GPU.
+    """
+    voxel = mesh_tsdf.voxel_size_from_bbox(
+        np.asarray(synthetic["truth"].vertices).min(axis=0),
+        np.asarray(synthetic["truth"].vertices).max(axis=0),
+        divisor=256,
+    )
+    mesh = mesh_tsdf.fuse_gpu(
+        depths=synthetic["depths"],
+        colors=synthetic["colors"],
+        intrinsics=synthetic["intrinsics"],
+        extrinsics=synthetic["extrinsics"],
+        config=mesh_tsdf.TSDFConfig(voxel_size=voxel, depth_max=5.0),
+        masks=synthetic["masks"],
+        device="CPU:0",
+    )
+
+    assert len(mesh.triangles) > 5_000
+    error = chamfer_percent(mesh, synthetic["truth"])
+    assert error < 1.0, f"TSDF tensor trop éloigné de la vérité terrain : {error:.3f} %"
+
+    # Les couleurs doivent ressortir dans [0, 1], à l'échelle où elles sont
+    # entrées : en 0-255 la fusion réussit aussi, mais le maillage sort saturé.
+    assert mesh.has_vertex_colors(), "aucune couleur intégrée"
+    colors = np.asarray(mesh.vertex_colors)
+    assert colors.max() <= 1.0, f"couleurs hors de [0, 1] : max {colors.max():.1f}"
+    assert np.allclose(colors.mean(axis=0), [0.8, 0.4, 0.0], atol=0.05), colors.mean(axis=0)
+
+
 def test_poisson_reconstructs_the_object(synthetic):
     points, colors = mesh_poisson.point_cloud_from_depths(
         synthetic["depths"],

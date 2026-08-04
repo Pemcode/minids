@@ -155,7 +155,12 @@ def fuse_gpu(
         )
         if not np.any(depth_np > 0):
             continue
-        color_np = (np.clip(colors[index], 0, 1) * 255).round().astype(np.uint8)
+        # L'API tensor n'accepte que deux combinaisons : (float, float) ou
+        # (uint16, uint8). La profondeur étant en float32, la couleur doit
+        # l'être aussi — une couleur uint8 fait échouer `integrate`. Et elle
+        # doit rester dans [0, 1] : en 0-255 la fusion réussit, mais les
+        # couleurs ressortent en 0-255 et le maillage sort saturé.
+        color_np = np.clip(colors[index], 0.0, 1.0).astype(np.float32)
 
         depth_image = o3d.t.geometry.Image(o3c.Tensor(depth_np, device=o3d_device))
         color_image = o3d.t.geometry.Image(o3c.Tensor(np.ascontiguousarray(color_np), device=o3d_device))
