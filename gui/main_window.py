@@ -52,13 +52,37 @@ from .workers import HealthWorker, JobListWorker, ScanRequest, ScanWorker
 VIDEO_FILTER = "Vidéos et images (*.mp4 *.mov *.m4v *.mkv *.avi *.webm);;Tous les fichiers (*)"
 
 # Réglages recommandés : valider la chaîne avant de payer un raffinement de 15 min.
+#
+# Chaque préréglage fixe `segmentation`. C'est délibéré : tant qu'elle en était
+# absente, un `none` choisi lors d'une répétition en mode factice survivait dans
+# les réglages persistés et repartait tel quel sur un scan payant — la scène
+# entière était alors reconstruite, plan de sol compris.
 PRESETS: dict[str, dict[str, Any]] = {
+    # Baseline démontrée par les spikes DepthScan SP-005 puis SP-012 : VGGT sur
+    # une vingtaine de vues, isolation géométrique, maillage Poisson, aucun
+    # raffinement. SP-012 la classe première sur huit méthodes comparées ; le
+    # 2DGS, lui, y finit sixième. C'est le point de départ pour juger la
+    # géométrie, avant toute question de texture ou d'échelle.
+    "Baseline VGGT  (~2 min)": {
+        "frames": 20,
+        "refine": False,
+        "backend": "poisson",
+        "compare": False,
+        "texture": "vertex",
+        "segmentation": "geometric",
+        "gs_iters": 12000,
+        "texture_size": 2048,
+        "target_triangles": 200000,
+        "voxel_divisor": 512,
+        "watertight": True,
+    },
     "Validation rapide  (~2 min)": {
         "frames": 100,
         "refine": False,
         "backend": "tsdf",
         "compare": False,
         "texture": "vertex",
+        "segmentation": "geometric",
         "gs_iters": 12000,
         "texture_size": 2048,
         "target_triangles": 200000,
@@ -71,6 +95,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "backend": "tsdf2dgs",
         "compare": False,
         "texture": "bake",
+        "segmentation": "auto",
         "gs_iters": 12000,
         "texture_size": 2048,
         "target_triangles": 200000,
@@ -83,6 +108,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "backend": "tsdf2dgs",
         "compare": True,
         "texture": "bake",
+        "segmentation": "auto",
         "gs_iters": 12000,
         "texture_size": 2048,
         "target_triangles": 200000,
@@ -713,6 +739,7 @@ class MainWindow(QMainWindow):
         self.backend_combo.setCurrentText(preset["backend"])
         self.compare_check.setChecked(preset["compare"])
         self.texture_combo.setCurrentText(preset["texture"])
+        self.segmentation_combo.setCurrentText(preset["segmentation"])
         self.gs_iters_spin.setValue(preset["gs_iters"])
         self.texture_size_combo.setCurrentText(str(preset["texture_size"]))
         self.target_tris_spin.setValue(preset["target_triangles"])
@@ -859,6 +886,8 @@ class MainWindow(QMainWindow):
         if self.segmentation_combo.currentText() == "sam3" and not self.prompt_edit.text().strip():
             QMessageBox.warning(self, "miniDS", "La segmentation SAM 3 exige un prompt texte non vide.")
             return
+        if not self._confirm_despite_disabled_segmentation():
+            return
         output_dir = Path(self.output_edit.text().strip() or "out").expanduser()
         if output_dir.exists() and not output_dir.is_dir():
             QMessageBox.warning(self, "miniDS", "Le chemin de sortie existe mais n'est pas un dossier.")
@@ -880,6 +909,32 @@ class MainWindow(QMainWindow):
             fetch_all=self.fetch_all_check.isChecked(),
         )
         self._launch(request, source.name)
+
+    def _confirm_despite_disabled_segmentation(self) -> bool:
+        """Prévient avant de reconstruire la scène entière plutôt que l'objet.
+
+        Sans segmentation, le nettoyage ne reçoit ni plan de support ni boîte
+        objet : le sol reste dans le maillage, la plus grosse composante peut
+        être le sol lui-même, et la taille de voxel se calcule sur la scène au
+        lieu de l'objet — donc bien moins de détail là où il compte.
+
+        On n'interdit pas : reconstruire une scène est un usage légitime. Mais
+        le défaut est de ne pas lancer, parce que le réglage se choisit une fois
+        et survit ensuite dans les réglages persistés.
+        """
+        if self.segmentation_combo.currentText() != "none":
+            return True
+        answer = QMessageBox.question(
+            self,
+            "miniDS",
+            "La segmentation est désactivée : c'est toute la scène qui sera reconstruite,\n"
+            "plan de support compris, et le nettoyage n'aura rien pour le retirer.\n\n"
+            "Pour un objet, choisis « geometric » — aucun prompt n'est nécessaire.\n\n"
+            "Lancer quand même ?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def _confirm_despite_missing_model_access(self) -> bool:
         """Prévient avant de payer un scan condamné à échouer sur `vggt`.

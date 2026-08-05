@@ -651,6 +651,77 @@ def test_attach_waits_through_the_starting_state(qapp, tmp_path, monkeypatch):
     assert worker._wait(ScanOutcome(job_id, "client_error", tmp_path))["status"] == "done"
 
 
+def test_every_preset_pins_the_segmentation(qapp, isolated_store):
+    """Le trou par lequel un scan payant a reconstruit la pièce entière.
+
+    Tant que `segmentation` manquait aux préréglages, un `none` choisi une fois
+    survivait dans `~/.minids/gui-settings.json` et repartait tel quel : la
+    scène était reconstruite au lieu de l'objet, et le nettoyage n'avait ni plan
+    de support ni boîte pour la recadrer.
+    """
+    from gui.main_window import PRESETS
+
+    named = {name: preset for name, preset in PRESETS.items() if preset}
+    missing = [name for name, preset in named.items() if "segmentation" not in preset]
+
+    assert not missing, f"préréglages sans segmentation : {missing}"
+    assert all(preset["segmentation"] != "none" for preset in named.values())
+
+
+def test_baseline_preset_matches_the_validated_recipe(qapp, isolated_store):
+    """Le préréglage « Baseline VGGT » reprend la recette classée première par SP-012.
+
+    Une vingtaine de vues, isolation géométrique, maillage Poisson, aucun
+    raffinement 2DGS.
+    """
+    from gui.main_window import MainWindow
+
+    window = MainWindow()
+    window.preset_combo.setCurrentText("Baseline VGGT  (~2 min)")
+
+    assert window.frames_spin.value() == 20
+    assert window.segmentation_combo.currentText() == "geometric"
+    assert window.backend_combo.currentText() == "poisson"
+    assert not window.refine_check.isChecked()
+
+    params = window._collect_params()
+    assert params["mesh_backends"] == ["poisson"]
+    assert params["segmentation"] == "geometric"
+    window.close()
+
+
+def test_disabled_segmentation_asks_before_reconstructing_the_scene(qapp, tmp_path, isolated_store, monkeypatch):
+    """Reconstruire la scène entière est légitime, mais jamais par accident."""
+    from PyQt6.QtWidgets import QMessageBox
+
+    from gui.main_window import MainWindow
+
+    asked: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args, **kwargs: (asked.append(args[2]), QMessageBox.StandardButton.No)[1],
+    )
+
+    window = MainWindow()
+    window.url_edit.setText("http://pod")
+    window.token_edit.setText("jeton")
+    window.source_edit.setText(str(tmp_path))
+    window.segmentation_combo.setCurrentText("none")
+
+    window.start_scan()
+
+    assert asked and "plan de support" in asked[0]
+    assert window.scan_worker is None, "un refus ne doit pas lancer le scan"
+
+    # « geometric » ne demande rien : c'est le chemin sans friction, sans prompt.
+    asked.clear()
+    window.segmentation_combo.setCurrentText("geometric")
+    assert window._confirm_despite_disabled_segmentation() is True
+    assert not asked
+    window.close()
+
+
 def test_collect_params_matches_server_schema(qapp, isolated_store):
     """Les paramètres produits doivent être acceptés par le modèle Pydantic du serveur."""
     from gui.main_window import MainWindow
