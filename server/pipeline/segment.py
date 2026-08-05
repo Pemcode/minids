@@ -269,6 +269,10 @@ def _segment_geometric(
     cloud.points = o3d.utility.Vector3dVector(points)
     cloud = cloud.voxel_down_sample(voxel_size=0.01)
     reduced = np.asarray(cloud.points)
+    # Sans cette ligne, le journal enchaîne « segmentation sur 4 938 967 points »
+    # puis « amas objet: 3242 points » : deux échelles différentes qu'on lit comme
+    # une perte catastrophique, alors que le sous-échantillonnage est voulu.
+    log_fn(f"sous-échantillonnage à 0.01 : {len(reduced)} points conservés")
 
     plane_model: np.ndarray | None = None
     remaining = reduced

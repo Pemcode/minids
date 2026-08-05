@@ -36,6 +36,12 @@ BACKEND_LABELS = {
     "poisson": "Poisson screened",
 }
 
+# Diviseur de la diagonale objet propre à Poisson. Quatre fois plus grossier que
+# le défaut TSDF (512) : le coût de Poisson est dominé par l'orientation des
+# normales, pas par la résolution de la grille. C'est l'ordre de grandeur retenu
+# par le benchmark géométrique DepthScan SP-012 sur un objet normalisé.
+POISSON_VOXEL_DIVISOR = 128
+
 
 def run_pipeline(job: Job, reporter: Reporter, settings: Settings) -> None:
     if settings.fake_gpu:
@@ -151,12 +157,17 @@ def run_pipeline(job: Job, reporter: Reporter, settings: Settings) -> None:
     if not backends:
         raise ValueError("aucun backend de maillage demandé")
 
-    voxel_size = mesh_tsdf.voxel_size_from_bbox(
-        segmentation.bbox_min if segmentation.bbox_min is not None else cloud.points.min(axis=0),
-        segmentation.bbox_max if segmentation.bbox_max is not None else cloud.points.max(axis=0),
-        int(params.get("voxel_divisor", 512)),
-    )
-    reporter.log(f"taille de voxel TSDF : {voxel_size:.5f} (unités scène normalisées)")
+    bbox_low = segmentation.bbox_min if segmentation.bbox_min is not None else cloud.points.min(axis=0)
+    bbox_high = segmentation.bbox_max if segmentation.bbox_max is not None else cloud.points.max(axis=0)
+    voxel_size = mesh_tsdf.voxel_size_from_bbox(bbox_low, bbox_high, int(params.get("voxel_divisor", 512)))
+    # Poisson n'est pas une grille TSDF, et la même taille de voxel n'y a pas le
+    # même prix. Le TSDF intègre chaque profondeur une fois ; Poisson garde les
+    # points, leur estime une normale, puis oriente le tout par un arbre couvrant
+    # dont le temps explose avec leur nombre. Au pas du TSDF (diagonale/512) le
+    # maillage ne rend plus la main. On repart donc de la même boîte objet, avec
+    # un pas propre à Poisson.
+    poisson_voxel = mesh_tsdf.voxel_size_from_bbox(bbox_low, bbox_high, POISSON_VOXEL_DIVISOR)
+    reporter.log(f"taille de voxel : TSDF {voxel_size:.5f}, Poisson {poisson_voxel:.5f} (unités scène normalisées)")
 
     reporter.stage("mesh")
     meshes: dict[str, Any] = {}
@@ -170,6 +181,7 @@ def run_pipeline(job: Job, reporter: Reporter, settings: Settings) -> None:
             normalized_depth,
             normalized_extrinsics,
             voxel_size,
+            poisson_voxel,
             settings,
             reporter,
         )
@@ -301,6 +313,7 @@ def _build_mesh(
     normalized_depth: np.ndarray,
     normalized_extrinsics: np.ndarray,
     voxel_size: float,
+    poisson_voxel: float,
     settings: Settings,
     reporter: Reporter,
 ) -> Any:
@@ -350,7 +363,7 @@ def _build_mesh(
             points,
             point_colors,
             normalized_extrinsics,
-            mesh_poisson.PoissonConfig(voxel_size=voxel_size),
+            mesh_poisson.PoissonConfig(voxel_size=poisson_voxel),
             reporter.log,
         )
 

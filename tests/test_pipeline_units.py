@@ -294,6 +294,7 @@ def test_mesh_device_selection_is_case_insensitive(monkeypatch):
         result.depth,
         result.extrinsics,
         0.01,
+        0.04,  # pas Poisson, distinct du pas TSDF
         SimpleNamespace(device="CUDA:0"),
         SimpleNamespace(log=lambda _message: None),
     )
