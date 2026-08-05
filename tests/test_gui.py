@@ -617,6 +617,76 @@ def test_attach_rejects_a_created_job_instead_of_polling_forever(qapp, tmp_path)
         worker._wait(ScanOutcome(job_id, "client_error", tmp_path))
 
 
+def test_a_silent_pod_does_not_end_the_tracking(qapp, tmp_path, monkeypatch):
+    """Un sondage qui échoue n'est pas un scan qui échoue.
+
+    Le pod se tait pendant les étapes lourdes — écriture du `.npz`, fusion,
+    bake — et le proxy coupe alors la requête. Abandonner à la première coupure
+    faisait perdre le suivi d'un job qui tournait parfaitement.
+    """
+    from gui.workers import MinidsError, ScanOutcome, ScanRequest, ScanWorker
+
+    class FlakyClient:
+        def __init__(self):
+            self.calls = 0
+
+        def status(self, _job_id):
+            self.calls += 1
+            if self.calls <= 3:
+                raise MinidsError("TimeoutError The read operation timed out")
+            return {"status": "done", "logs": [], "progress": 1.0}
+
+    job_id = "b" * 32
+    worker = ScanWorker(
+        ScanRequest(
+            url="http://127.0.0.1:8000",
+            token="token",
+            source=tmp_path,
+            output_dir=tmp_path / "out",
+            params={},
+            job_id=job_id,
+            poll_seconds=0.01,
+        )
+    )
+    client = FlakyClient()
+    worker._client = client
+
+    assert worker._wait(ScanOutcome(job_id, "client_error", tmp_path))["status"] == "done"
+    assert client.calls == 4, "les trois coupures auraient dû être retentées"
+
+
+def test_a_pod_silent_too_long_gives_up_with_the_job_id(qapp, tmp_path, monkeypatch):
+    """Le garde-fou du test précédent : le silence ne peut pas durer indéfiniment.
+
+    Le message d'abandon doit porter l'identifiant, puisque le job continue
+    côté pod et se rejoint.
+    """
+    from gui import workers
+    from gui.workers import MinidsError, ScanOutcome, ScanRequest, ScanWorker
+
+    class DeadClient:
+        def status(self, _job_id):
+            raise MinidsError("TimeoutError The read operation timed out")
+
+    job_id = "c" * 32
+    worker = ScanWorker(
+        ScanRequest(
+            url="http://127.0.0.1:8000",
+            token="token",
+            source=tmp_path,
+            output_dir=tmp_path / "out",
+            params={},
+            job_id=job_id,
+            poll_seconds=0.001,
+        )
+    )
+    worker._client = DeadClient()
+    monkeypatch.setattr(workers, "SILENCE_TOLERANCE_SECONDS", 0.05)
+
+    with pytest.raises(MinidsError, match=job_id):
+        worker._wait(ScanOutcome(job_id, "client_error", tmp_path))
+
+
 def test_attach_waits_through_the_starting_state(qapp, tmp_path, monkeypatch):
     from gui import workers
     from gui.workers import ScanOutcome, ScanRequest, ScanWorker

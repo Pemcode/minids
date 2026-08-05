@@ -35,6 +35,11 @@ from client.transport import (
 
 DEFAULT_ARTIFACTS = ["mesh.glb", "report.json", "preview.png"]
 
+# Silence consécutif toléré du pod pendant le suivi. Généreux à dessein :
+# une étape lourde peut monopoliser la machine plusieurs minutes, et perdre
+# le suivi d'un job qui tourne coûte bien plus cher qu'attendre.
+SILENCE_TOLERANCE_SECONDS = 600.0
+
 
 @dataclass
 class ScanRequest:
@@ -151,6 +156,7 @@ class ScanWorker(QThread):
         self.request = request
         self._cancelled = False
         self._cancel_sent = False
+        self._silent_since: float | None = None
         self._cancel_confirmed = False
         self._detach_requested = False
         self._created_locally = False
@@ -350,12 +356,44 @@ class ScanWorker(QThread):
         self._start_confirmed = response.get("status") in {"starting", "queued", "running", "done"}
         self.log.emit(f"lancé (file d'attente : {response.get('queue_position', 0)})")
 
+    def _poll_status(self, client: MinidsClient) -> dict[str, Any] | None:
+        """État du job, ou `None` si le pod n'a pas répondu à ce tour.
+
+        Un sondage qui échoue n'est pas un scan qui échoue. Le pod se tait
+        régulièrement pendant les étapes lourdes — écriture du `.npz`, fusion,
+        bake de texture — et le proxy coupe alors la requête. Abandonner à la
+        première coupure faisait perdre le suivi d'un job qui, lui, continuait
+        parfaitement.
+
+        On tolère donc le silence jusqu'à `SILENCE_TOLERANCE_SECONDS`
+        **consécutives**, remises à zéro dès qu'une réponse arrive.
+        """
+        try:
+            state = client.status(self._job_id)
+        except MinidsError as exc:
+            now = time.monotonic()
+            if self._silent_since is None:
+                self._silent_since = now
+                self.log.emit(f"pod momentanément muet ({exc}) — le job continue, suivi maintenu")
+            silence = now - self._silent_since
+            if silence > SILENCE_TOLERANCE_SECONDS:
+                raise MinidsError(
+                    f"pod injoignable depuis {silence / 60:.0f} min. Le job tourne peut-être encore : "
+                    f"« Rejoindre » avec l'identifiant {self._job_id} reprendra le suivi."
+                ) from exc
+            return None
+        if self._silent_since is not None:
+            self.log.emit(f"pod de nouveau joignable après {time.monotonic() - self._silent_since:.0f} s")
+            self._silent_since = None
+        return state
+
     def _wait(self, outcome: ScanOutcome) -> dict[str, Any]:
         client = self._client_or_error()
         self.phase_changed.emit("attente")
         step = time.monotonic()
         previous_logs: list[Any] = []
         log_cursor: int | None = None
+        self._silent_since = None
 
         while True:
             if self._detach_requested and not self._cancelled:
@@ -367,7 +405,10 @@ class ScanWorker(QThread):
                 self.log.emit("annulation du job côté pod…")
                 self._try_cancel_remote()
 
-            state = client.status(self._job_id)
+            state = self._poll_status(client)
+            if state is None:  # pod momentanément muet : on réessaie
+                self.msleep(max(1, int(self.request.poll_seconds * 1000)))
+                continue
             logs = state.get("logs", [])
             if not isinstance(logs, list):
                 raise MinidsError("état du job : journal invalide")
